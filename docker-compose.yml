@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  healthbot:
+    build: .
+    ports:
+      - "5000:5000"
+    env_file:
+      - docker.env
+    volumes:
+      - ./logs:/app/logs
+      - ./models:/app/models
+      - ./database:/app/database
+      - ./augmented_synthetic_health_dataset.csv:/app/augmented_synthetic_health_dataset.csv
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  redis_data:
