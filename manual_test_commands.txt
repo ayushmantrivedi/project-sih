@@ -1,0 +1,55 @@
+# Manual Test Commands for Your Master Branch Files
+# Copy and paste these commands one by one in your terminal
+
+# Test 1: Check if files exist
+echo "Checking required files..."
+ls -la models/ml_predict.py
+ls -la models/sihdemo.py
+ls -la chatbot.py
+ls -la quick_trained_model.joblib
+
+# Test 2: Test ML model import
+python3 -c "
+from models.ml_predict import predict_disease
+print('✅ ML model imported successfully')
+"
+
+# Test 3: Test ML model prediction
+python3 -c "
+from models.ml_predict import predict_disease
+prediction, confidence, probabilities = predict_disease('I have fever and cough')
+print(f'✅ ML Prediction: {prediction} (Confidence: {confidence:.3f})')
+"
+
+# Test 4: Test chatbot import
+python3 -c "
+from chatbot import generate_bot_response
+print('✅ Chatbot imported successfully')
+"
+
+# Test 5: Test chatbot with ML model
+python3 -c "
+from chatbot import generate_bot_response
+response = generate_bot_response('I have fever and cough')
+print(f'✅ Chatbot Response: {response.get(\"type\")} - {response.get(\"disease\")} ({response.get(\"confidence\", 0):.3f})')
+"
+
+# Test 6: Test different symptoms
+python3 -c "
+from chatbot import generate_bot_response
+symptoms = ['I have headache and nausea', 'I have chest pain', 'I have stomach pain']
+for symptom in symptoms:
+    response = generate_bot_response(symptom)
+    print(f'{symptom} -> {response.get(\"type\")} - {response.get(\"disease\")} ({response.get(\"confidence\", 0):.3f})')
+"
+
+# Test 7: Test configuration
+python3 -c "
+from config import get_config
+config = get_config()
+print(f'✅ Config loaded: {type(config)}')
+if hasattr(config, 'ml'):
+    print(f'✅ ML config found')
+else:
+    print('⚠️  ML config not found')
+"
