@@ -8,6 +8,7 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # suppress TF INFO
 
 import re
 import random
+import json
 from typing import List, Optional, Tuple
 import argparse
 
@@ -25,6 +26,7 @@ from transformers import BertTokenizerFast, TFBertModel
 # -----------------------------
 MODEL_NAME = "emilyalsentzer/Bio_ClinicalBERT"
 CSV_PATH = r"C:\Users\ayush\OneDrive\Desktop\augmented_synthetic_health_dataset.csv"  # hardcoded raw string
+JSON_PATH = r"C:\Users\ayush\OneDrive\Desktop\diagnosis_data.json"  # JSON data path
 MAX_LEN = 64
 BATCH_SIZE = 16
 NUM_EPOCHS = 30
@@ -83,9 +85,49 @@ def simple_tokenize(text: str, lang_hint: Optional[str] = None) -> str:
 # -----------------------------
 # Data prep and embedding precompute
 # -----------------------------
-def load_and_prepare(csv_path: str):
-    df = pd.read_csv(csv_path)
-    assert "symptoms" in df.columns and "disease" in df.columns, "CSV must contain 'symptoms' and 'disease' columns"
+def load_json_data(json_path: str) -> pd.DataFrame:
+    """Load data from JSON file and convert to DataFrame"""
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # Convert JSON to DataFrame
+        df = pd.DataFrame(data)
+        
+        # Ensure required columns exist
+        if "symptoms" not in df.columns or "disease" not in df.columns:
+            raise ValueError("JSON file must contain 'symptoms' and 'disease' columns")
+        
+        print(f"✅ Loaded {len(df)} records from JSON file: {json_path}")
+        return df
+    except Exception as e:
+        print(f"❌ Error loading JSON file {json_path}: {e}")
+        return pd.DataFrame()
+
+def load_and_prepare(csv_path: str, json_path: str = None):
+    # Load CSV data
+    df_csv = pd.read_csv(csv_path)
+    assert "symptoms" in df_csv.columns and "disease" in df_csv.columns, "CSV must contain 'symptoms' and 'disease' columns"
+    print(f"✅ Loaded {len(df_csv)} records from CSV file: {csv_path}")
+    
+    # Load JSON data if provided
+    df_json = pd.DataFrame()
+    if json_path and os.path.exists(json_path):
+        df_json = load_json_data(json_path)
+    
+    # Combine datasets
+    if not df_json.empty:
+        # Ensure both datasets have the same columns
+        common_cols = set(df_csv.columns) & set(df_json.columns)
+        df_csv = df_csv[list(common_cols)]
+        df_json = df_json[list(common_cols)]
+        
+        # Combine the datasets
+        df = pd.concat([df_csv, df_json], ignore_index=True)
+        print(f"✅ Combined dataset: {len(df_csv)} CSV + {len(df_json)} JSON = {len(df)} total records")
+    else:
+        df = df_csv
+        print(f"✅ Using only CSV data: {len(df)} records")
 
     # text processing column: use 'symptoms' (and 'description' if present)
     text_cols = ["symptoms"]
@@ -369,6 +411,7 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--csv", type=str, default=CSV_PATH)
+    parser.add_argument("--json", type=str, default=JSON_PATH)
     parser.add_argument("--out_weights", type=str, default="best_classifier_weights.h5")
     parser.add_argument("--out_bundle", type=str, default="sih_model_bundle.joblib")
     parser.add_argument("--epochs", type=int, default=NUM_EPOCHS)
@@ -379,10 +422,9 @@ def main():
     if not os.path.exists(args.csv):
         raise SystemExit(f"CSV not found: {args.csv}")
 
-
-    print("Loading dataframe...")
-    df = pd.read_csv(args.csv)
-    assert "symptoms" in df.columns and "disease" in df.columns, "CSV must contain 'symptoms' and 'disease' columns"
+    print("Loading combined dataset (CSV + JSON)...")
+    df = load_and_prepare(args.csv, args.json)
+    assert "symptoms" in df.columns and "disease" in df.columns, "Combined dataset must contain 'symptoms' and 'disease' columns"
 
     # load tokenizer + encoder
     print("Loading tokenizer and TF encoder (this will download model if not present)...")
