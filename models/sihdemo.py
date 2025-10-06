@@ -26,7 +26,7 @@ from transformers import BertTokenizerFast, TFBertModel
 # -----------------------------
 MODEL_NAME = "emilyalsentzer/Bio_ClinicalBERT"
 CSV_PATH = r"C:\Users\ayush\OneDrive\Desktop\augmented_synthetic_health_dataset.csv"  # hardcoded raw string
-JSON_PATH = "/workspace/diagnosis_data.json"  # JSON data path
+JSON_PATH = r"C:\Users\ayush\OneDrive\Desktop\diagnosis_data.json"  # JSON data path
 MAX_LEN = 64
 BATCH_SIZE = 16
 NUM_EPOCHS = 30

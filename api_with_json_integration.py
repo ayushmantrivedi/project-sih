@@ -185,7 +185,7 @@ def model_info():
         },
         "data_sources": {
             "csv_data": "C:\\Users\\ayush\\OneDrive\\Desktop\\augmented_synthetic_health_dataset.csv",
-            "json_data": "/workspace/diagnosis_data.json"
+            "json_data": "C:\\Users\\ayush\\OneDrive\\Desktop\\diagnosis_data.json"
         }
     })
 
