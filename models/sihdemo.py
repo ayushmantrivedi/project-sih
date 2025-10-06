@@ -9,6 +9,7 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # suppress TF INFO
 import re
 import random
 import json
+import gc
 from typing import List, Optional, Tuple
 import argparse
 
@@ -640,23 +641,57 @@ def main():
         y_test = le.transform(df_test["disease"].astype(str))
 
 
-        # --- Diagnostics: Check for duplicates and class imbalance ---
-        train_dupes = df_train.duplicated(subset=["text_proc"] + numeric_cols).sum()
-        test_dupes = df_test.duplicated(subset=["text_proc"] + numeric_cols).sum()
-        overlap = pd.merge(df_train, df_test, on=["text_proc"] + numeric_cols, how="inner")
-        print(f"[Diagnostics] Train duplicates: {train_dupes}, Test duplicates: {test_dupes}, Overlap: {len(overlap)}")
-        train_class_counts = df_train["disease"].value_counts()
-        test_class_counts = df_test["disease"].value_counts()
-        print(f"[Diagnostics] Train class distribution:\n{train_class_counts}")
-        print(f"[Diagnostics] Test class distribution:\n{test_class_counts}")
+        # --- Diagnostics: Check for duplicates and class imbalance (memory optimized) ---
+        print(f"[Diagnostics] Processing {len(df_train):,} train and {len(df_test):,} test records...")
+        
+        # Memory-efficient duplicate checking
+        try:
+            train_dupes = df_train.duplicated(subset=["text_proc"]).sum()
+            test_dupes = df_test.duplicated(subset=["text_proc"]).sum()
+            print(f"[Diagnostics] Train duplicates: {train_dupes}, Test duplicates: {test_dupes}")
+        except Exception as e:
+            print(f"[Diagnostics] Duplicate check skipped due to memory constraints: {e}")
+            train_dupes = test_dupes = 0
+        
+        # Memory-efficient overlap checking (sample-based for large datasets)
+        try:
+            if len(df_train) > 10000 or len(df_test) > 10000:
+                # Sample-based overlap check for large datasets
+                sample_size = min(5000, len(df_train), len(df_test))
+                train_sample = df_train.sample(n=sample_size, random_state=42)
+                test_sample = df_test.sample(n=sample_size, random_state=42)
+                overlap = pd.merge(train_sample, test_sample, on=["text_proc"], how="inner")
+                estimated_overlap = len(overlap) * (len(df_train) * len(df_test)) / (sample_size * sample_size)
+                print(f"[Diagnostics] Estimated overlap: ~{int(estimated_overlap):,} (based on {sample_size:,} sample)")
+            else:
+                overlap = pd.merge(df_train, df_test, on=["text_proc"], how="inner")
+                print(f"[Diagnostics] Overlap: {len(overlap)}")
+        except Exception as e:
+            print(f"[Diagnostics] Overlap check skipped due to memory constraints: {e}")
+        
+        # Class distribution (memory efficient)
+        try:
+            train_class_counts = df_train["disease"].value_counts()
+            test_class_counts = df_test["disease"].value_counts()
+            print(f"[Diagnostics] Train classes: {len(train_class_counts)}, Test classes: {len(test_class_counts)}")
+            print(f"[Diagnostics] Top 5 train classes: {train_class_counts.head().to_dict()}")
+            print(f"[Diagnostics] Top 5 test classes: {test_class_counts.head().to_dict()}")
+        except Exception as e:
+            print(f"[Diagnostics] Class distribution check failed: {e}")
 
         # Training and evaluation for this fold
         texts_train = df_train["text_proc"].tolist()
         texts_test = df_test["text_proc"].tolist()
-        print("Precomputing encoder embeddings for train set...")
-        emb_train = precompute_encoder_embeddings(tokenizer, encoder, texts_train, max_len=MAX_LEN, batch_size=32)
-        print("Precomputing encoder embeddings for test set...")
-        emb_test = precompute_encoder_embeddings(tokenizer, encoder, texts_test, max_len=MAX_LEN, batch_size=32)
+        
+        # Memory optimization for large datasets
+        batch_size_emb = 8 if len(texts_train) > 50000 else 16
+        
+        print(f"Precomputing encoder embeddings for train set ({len(texts_train):,} records)...")
+        print(f"Using batch size: {batch_size_emb} for memory optimization")
+        emb_train = precompute_encoder_embeddings(tokenizer, encoder, texts_train, max_len=MAX_LEN, batch_size=batch_size_emb)
+        
+        print(f"Precomputing encoder embeddings for test set ({len(texts_test):,} records)...")
+        emb_test = precompute_encoder_embeddings(tokenizer, encoder, texts_test, max_len=MAX_LEN, batch_size=batch_size_emb)
 
         def fuse(emb, num):
             if num is None or num.shape[-1] == 0:
@@ -682,6 +717,12 @@ def main():
         test_loss, test_acc, test_f1, test_preds, test_trues = eval_on_fused_numpy(trained_classifier, test_fused, y_test, loss_fn)
         print(f"Fold {fold+1} | Loss: {test_loss:.6f} | Acc: {test_acc:.4f} | F1: {test_f1:.4f}")
         fold_metrics.append((test_loss, test_acc, test_f1))
+        
+        # Memory cleanup after each fold
+        del df_train, df_test, texts_train, texts_test, emb_train, emb_test, train_fused, test_fused
+        del trained_classifier, classifier
+        gc.collect()
+        print(f"🧹 Memory cleaned after fold {fold+1}")
 
     # Report average metrics
     avg_loss = np.mean([m[0] for m in fold_metrics])
