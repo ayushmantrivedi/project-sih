@@ -20,7 +20,7 @@ def main():
     parser = argparse.ArgumentParser(description='Train ML model with CSV and JSON data')
     parser.add_argument('--csv', type=str, default='C:\\Users\\ayush\\OneDrive\\Desktop\\augmented_synthetic_health_dataset.csv',
                        help='Path to CSV training data')
-    parser.add_argument('--json', type=str, default='C:\\Users\\ayush\\OneDrive\\Desktop\\diagnosis_data.json',
+    parser.add_argument('--json', type=str, default='/workspace/diagnosis_data.json',
                        help='Path to JSON training data')
     parser.add_argument('--epochs', type=int, default=5,
                        help='Number of training epochs (reduced for demo)')
