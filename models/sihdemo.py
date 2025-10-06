@@ -28,8 +28,8 @@ MODEL_NAME = "emilyalsentzer/Bio_ClinicalBERT"
 CSV_PATH = r"C:\Users\ayush\OneDrive\Desktop\augmented_synthetic_health_dataset.csv"  # hardcoded raw string
 JSON_PATH = r"C:\Users\ayush\OneDrive\Desktop\diagnosis_data.json"  # JSON data path
 MAX_LEN = 64
-BATCH_SIZE = 16
-NUM_EPOCHS = 30
+BATCH_SIZE = 32  # Increased for large dataset
+NUM_EPOCHS = 20  # Reduced for faster training with large dataset
 BASE_LR = 2e-5
 SEED = 42
 EN_STOPWORDS = set(["and","or","the","is","a","an","it","to","of","in","for","on","with"])
@@ -88,6 +88,9 @@ def simple_tokenize(text: str, lang_hint: Optional[str] = None) -> str:
 def load_json_data(json_path: str) -> pd.DataFrame:
     """Load data from JSON file and convert to DataFrame"""
     try:
+        print(f"🔄 Loading large JSON file: {json_path}")
+        print("⏳ This may take a moment for 100,000 records...")
+        
         with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         
@@ -98,7 +101,9 @@ def load_json_data(json_path: str) -> pd.DataFrame:
         if "symptoms" not in df.columns or "disease" not in df.columns:
             raise ValueError("JSON file must contain 'symptoms' and 'disease' columns")
         
-        print(f"✅ Loaded {len(df)} records from JSON file: {json_path}")
+        print(f"✅ Successfully loaded {len(df):,} records from JSON file: {json_path}")
+        print(f"📊 JSON data shape: {df.shape}")
+        print(f"📋 JSON columns: {list(df.columns)}")
         return df
     except Exception as e:
         print(f"❌ Error loading JSON file {json_path}: {e}")
@@ -117,17 +122,25 @@ def load_and_prepare(csv_path: str, json_path: str = None):
     
     # Combine datasets
     if not df_json.empty:
+        print(f"🔄 Combining datasets...")
+        print(f"📊 CSV data: {len(df_csv):,} records")
+        print(f"📊 JSON data: {len(df_json):,} records")
+        
         # Ensure both datasets have the same columns
         common_cols = set(df_csv.columns) & set(df_json.columns)
+        print(f"🔗 Common columns: {list(common_cols)}")
+        
         df_csv = df_csv[list(common_cols)]
         df_json = df_json[list(common_cols)]
         
         # Combine the datasets
+        print("⏳ Concatenating large datasets...")
         df = pd.concat([df_csv, df_json], ignore_index=True)
-        print(f"✅ Combined dataset: {len(df_csv)} CSV + {len(df_json)} JSON = {len(df)} total records")
+        print(f"✅ Combined dataset: {len(df_csv):,} CSV + {len(df_json):,} JSON = {len(df):,} total records")
+        print(f"🎯 Total training data: {len(df):,} records")
     else:
         df = df_csv
-        print(f"✅ Using only CSV data: {len(df)} records")
+        print(f"✅ Using only CSV data: {len(df):,} records")
 
     # text processing column: use 'symptoms' (and 'description' if present)
     text_cols = ["symptoms"]
@@ -184,7 +197,7 @@ def load_and_prepare(csv_path: str, json_path: str = None):
 
     return df, numeric_cols, le
 
-def precompute_encoder_embeddings(tokenizer, encoder, texts: List[str], max_len: int = MAX_LEN, batch_size: int = 32) -> np.ndarray:
+def precompute_encoder_embeddings(tokenizer, encoder, texts: List[str], max_len: int = MAX_LEN, batch_size: int = 16) -> np.ndarray:
     all_embs = []
     for i in range(0, len(texts), batch_size):
         batch_texts = texts[i:i+batch_size]
