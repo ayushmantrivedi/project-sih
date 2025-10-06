@@ -86,7 +86,7 @@ def simple_tokenize(text: str, lang_hint: Optional[str] = None) -> str:
 # Data prep and embedding precompute
 # -----------------------------
 def load_json_data(json_path: str) -> pd.DataFrame:
-    """Load data from JSON file and convert to DataFrame"""
+    """Load data from JSON file and convert to DataFrame with robust error handling"""
     try:
         print(f"🔄 Loading large JSON file: {json_path}")
         print("⏳ This may take a moment for 100,000 records...")
@@ -96,24 +96,147 @@ def load_json_data(json_path: str) -> pd.DataFrame:
         
         # Convert JSON to DataFrame
         df = pd.DataFrame(data)
+        print(f"📊 Raw JSON data shape: {df.shape}")
+        print(f"📋 Available columns: {list(df.columns)}")
         
-        # Ensure required columns exist
-        if "symptoms" not in df.columns or "disease" not in df.columns:
-            raise ValueError("JSON file must contain 'symptoms' and 'disease' columns")
+        # Robust column mapping - try different possible column names
+        column_mapping = {
+            'symptoms': ['symptoms', 'symptom', 'symptom_text', 'complaint', 'complaints', 'description', 'desc'],
+            'disease': ['disease', 'diagnosis', 'condition', 'illness', 'disorder', 'label', 'target', 'outcome']
+        }
         
-        print(f"✅ Successfully loaded {len(df):,} records from JSON file: {json_path}")
-        print(f"📊 JSON data shape: {df.shape}")
-        print(f"📋 JSON columns: {list(df.columns)}")
-        return df
+        # Find the best matching columns
+        found_symptoms = None
+        found_disease = None
+        
+        for col in df.columns:
+            col_lower = col.lower().strip()
+            for symptom_variant in column_mapping['symptoms']:
+                if symptom_variant in col_lower or col_lower in symptom_variant:
+                    found_symptoms = col
+                    break
+            if found_symptoms:
+                break
+        
+        for col in df.columns:
+            col_lower = col.lower().strip()
+            for disease_variant in column_mapping['disease']:
+                if disease_variant in col_lower or col_lower in disease_variant:
+                    found_disease = col
+                    break
+            if found_disease:
+                break
+        
+        # Handle missing required columns
+        if not found_symptoms and not found_disease:
+            print("⚠️  No suitable columns found for symptoms or disease")
+            print("💡 Available columns:", list(df.columns))
+            print("🔄 Attempting to use first two text columns...")
+            
+            # Try to use first two text columns
+            text_cols = []
+            for col in df.columns:
+                if df[col].dtype == 'object':  # Text columns
+                    text_cols.append(col)
+            
+            if len(text_cols) >= 2:
+                found_symptoms = text_cols[0]
+                found_disease = text_cols[1]
+                print(f"✅ Using '{found_symptoms}' as symptoms and '{found_disease}' as disease")
+            else:
+                print("❌ Not enough text columns found. Skipping JSON data.")
+                return pd.DataFrame()
+        
+        elif not found_symptoms:
+            print("⚠️  No symptoms column found. Looking for alternative...")
+            # Use description or first text column as symptoms
+            text_cols = [col for col in df.columns if df[col].dtype == 'object' and col != found_disease]
+            if text_cols:
+                found_symptoms = text_cols[0]
+                print(f"✅ Using '{found_symptoms}' as symptoms")
+            else:
+                print("❌ No suitable symptoms column found. Skipping JSON data.")
+                return pd.DataFrame()
+        
+        elif not found_disease:
+            print("⚠️  No disease column found. Looking for alternative...")
+            # Use last text column or create dummy disease
+            text_cols = [col for col in df.columns if df[col].dtype == 'object' and col != found_symptoms]
+            if text_cols:
+                found_disease = text_cols[-1]
+                print(f"✅ Using '{found_disease}' as disease")
+            else:
+                print("⚠️  No disease column found. Creating 'unknown' disease for all records...")
+                df['disease'] = 'unknown'
+                found_disease = 'disease'
+        
+        # Rename columns to standard format
+        df_standardized = df.copy()
+        if found_symptoms != 'symptoms':
+            df_standardized['symptoms'] = df[found_symptoms]
+            print(f"🔄 Renamed '{found_symptoms}' → 'symptoms'")
+        
+        if found_disease != 'disease':
+            df_standardized['disease'] = df[found_disease]
+            print(f"🔄 Renamed '{found_disease}' → 'disease'")
+        
+        # Clean and validate the data
+        df_standardized = df_standardized.dropna(subset=['symptoms', 'disease'])
+        df_standardized['symptoms'] = df_standardized['symptoms'].astype(str)
+        df_standardized['disease'] = df_standardized['disease'].astype(str)
+        
+        # Remove empty or very short entries
+        df_standardized = df_standardized[
+            (df_standardized['symptoms'].str.len() > 3) & 
+            (df_standardized['disease'].str.len() > 1)
+        ]
+        
+        print(f"✅ Successfully loaded and processed {len(df_standardized):,} records from JSON file")
+        print(f"📊 Final JSON data shape: {df_standardized.shape}")
+        print(f"📋 Final columns: {list(df_standardized.columns)}")
+        print(f"🎯 Disease distribution: {df_standardized['disease'].value_counts().head()}")
+        
+        return df_standardized
+        
     except Exception as e:
         print(f"❌ Error loading JSON file {json_path}: {e}")
+        print("💡 The model will continue with CSV data only")
         return pd.DataFrame()
 
 def load_and_prepare(csv_path: str, json_path: str = None):
-    # Load CSV data
-    df_csv = pd.read_csv(csv_path)
-    assert "symptoms" in df_csv.columns and "disease" in df_csv.columns, "CSV must contain 'symptoms' and 'disease' columns"
-    print(f"✅ Loaded {len(df_csv)} records from CSV file: {csv_path}")
+    # Load CSV data with robust error handling
+    try:
+        df_csv = pd.read_csv(csv_path)
+        print(f"✅ Loaded {len(df_csv):,} records from CSV file: {csv_path}")
+        print(f"📋 CSV columns: {list(df_csv.columns)}")
+        
+        # Check for required columns in CSV
+        if "symptoms" not in df_csv.columns or "disease" not in df_csv.columns:
+            print("⚠️  CSV missing required columns. Attempting to find alternatives...")
+            
+            # Try to find alternative column names
+            found_symptoms = None
+            found_disease = None
+            
+            for col in df_csv.columns:
+                col_lower = col.lower().strip()
+                if any(x in col_lower for x in ['symptom', 'complaint', 'description']):
+                    found_symptoms = col
+                if any(x in col_lower for x in ['disease', 'diagnosis', 'condition', 'label']):
+                    found_disease = col
+            
+            if found_symptoms and found_disease:
+                df_csv['symptoms'] = df_csv[found_symptoms]
+                df_csv['disease'] = df_csv[found_disease]
+                print(f"✅ Mapped '{found_symptoms}' → 'symptoms' and '{found_disease}' → 'disease'")
+            else:
+                raise ValueError("CSV file must contain 'symptoms' and 'disease' columns or suitable alternatives")
+        
+        print(f"✅ CSV data validated: {len(df_csv):,} records")
+        
+    except Exception as e:
+        print(f"❌ Error loading CSV file {csv_path}: {e}")
+        raise SystemExit(f"Failed to load CSV data: {e}")
     
     # Load JSON data if provided
     df_json = pd.DataFrame()
