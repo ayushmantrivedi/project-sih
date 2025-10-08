@@ -602,6 +602,9 @@ def main():
         df_test = process_text_data(df_test, augment=False)  # No augmentation for test data
 
         # Numeric features
+        text_cols = ["symptoms"]
+        if "description" in df_train.columns:
+            text_cols.append("description")
         exclude = set(text_cols + ["text_comb", "text_proc", "disease"])
         numeric_cols = [c for c in df_train.columns if c not in exclude and pd.api.types.is_numeric_dtype(df_train[c])]
         # Scaling: fit only on train, transform both
