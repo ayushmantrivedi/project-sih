@@ -204,6 +204,150 @@ def load_json_data(json_path: str) -> pd.DataFrame:
         print("💡 The model will continue with CSV data only")
         return pd.DataFrame()
 
+def perform_eda_and_preprocessing(df, dataset_name="Dataset"):
+    """Comprehensive EDA and preprocessing pipeline"""
+    print(f"\n🔍 EDA and Preprocessing for {dataset_name}")
+    print("=" * 60)
+    
+    original_size = len(df)
+    print(f"📊 Original dataset size: {original_size:,} records")
+    print(f"📋 Columns: {list(df.columns)}")
+    print(f"📊 Shape: {df.shape}")
+    
+    # 1. Basic Info
+    print(f"\n📈 Data Types:")
+    for col in df.columns:
+        print(f"   {col}: {df[col].dtype} (missing: {df[col].isnull().sum():,})")
+    
+    # 2. Check for required columns
+    if "symptoms" not in df.columns or "disease" in df.columns:
+        print("⚠️  Missing required columns. Attempting to find alternatives...")
+        found_symptoms = None
+        found_disease = None
+        
+        for col in df.columns:
+            col_lower = col.lower().strip()
+            if any(x in col_lower for x in ['symptom', 'complaint', 'description', 'text']):
+                found_symptoms = col
+            if any(x in col_lower for x in ['disease', 'diagnosis', 'condition', 'label', 'target']):
+                found_disease = col
+        
+        if found_symptoms and found_disease:
+            df['symptoms'] = df[found_symptoms]
+            df['disease'] = df[found_disease]
+            print(f"✅ Mapped '{found_symptoms}' → 'symptoms' and '{found_disease}' → 'disease'")
+        else:
+            raise ValueError("Cannot find suitable columns for symptoms and disease")
+    
+    # 3. Clean symptoms data
+    print(f"\n🧹 Cleaning symptoms data...")
+    symptoms_before = len(df)
+    
+    # Remove rows with missing symptoms or disease
+    df = df.dropna(subset=['symptoms', 'disease'])
+    print(f"   Removed {symptoms_before - len(df):,} rows with missing symptoms/disease")
+    
+    # Convert to string and clean
+    df['symptoms'] = df['symptoms'].astype(str).str.strip()
+    df['disease'] = df['disease'].astype(str).str.strip()
+    
+    # Remove empty or very short symptoms
+    df = df[df['symptoms'].str.len() > 3]
+    df = df[df['symptoms'] != '']
+    df = df[df['symptoms'] != 'nan']
+    
+    # Remove very short diseases
+    df = df[df['disease'].str.len() > 1]
+    df = df[df['disease'] != '']
+    df = df[df['disease'] != 'nan']
+    
+    symptoms_after = len(df)
+    print(f"   Removed {symptoms_before - symptoms_after:,} rows with invalid symptoms/disease")
+    
+    # 4. Deduplication analysis
+    print(f"\n🔍 Duplicate Analysis:")
+    total_duplicates = df.duplicated().sum()
+    symptom_duplicates = df.duplicated(subset=['symptoms']).sum()
+    full_duplicates = df.duplicated(subset=['symptoms', 'disease']).sum()
+    
+    print(f"   Total duplicates: {total_duplicates:,}")
+    print(f"   Symptom duplicates: {symptom_duplicates:,}")
+    print(f"   Full duplicates: {full_duplicates:,}")
+    
+    # Remove duplicates
+    df_before_dedup = len(df)
+    df = df.drop_duplicates(subset=['symptoms', 'disease'], keep='first')
+    df_after_dedup = len(df)
+    print(f"   Removed {df_before_dedup - df_after_dedup:,} duplicate records")
+    
+    # 5. Disease distribution analysis
+    print(f"\n🎯 Disease Distribution Analysis:")
+    disease_counts = df['disease'].value_counts()
+    print(f"   Total unique diseases: {len(disease_counts)}")
+    print(f"   Most common diseases:")
+    for disease, count in disease_counts.head(10).items():
+        print(f"     {disease}: {count:,} ({count/len(df)*100:.1f}%)")
+    
+    # Check for class imbalance
+    min_class_size = disease_counts.min()
+    max_class_size = disease_counts.max()
+    imbalance_ratio = max_class_size / min_class_size
+    
+    print(f"   Class imbalance ratio: {imbalance_ratio:.1f}:1")
+    if imbalance_ratio > 10:
+        print("   ⚠️  High class imbalance detected")
+    elif imbalance_ratio > 5:
+        print("   ⚠️  Moderate class imbalance detected")
+    else:
+        print("   ✅ Balanced classes")
+    
+    # 6. Symptoms analysis
+    print(f"\n📝 Symptoms Analysis:")
+    symptom_lengths = df['symptoms'].str.len()
+    print(f"   Average symptom length: {symptom_lengths.mean():.1f} characters")
+    print(f"   Min length: {symptom_lengths.min()}")
+    print(f"   Max length: {symptom_lengths.max()}")
+    print(f"   Median length: {symptom_lengths.median():.1f}")
+    
+    # Check for very long symptoms (potential data quality issues)
+    very_long = (symptom_lengths > 500).sum()
+    if very_long > 0:
+        print(f"   ⚠️  {very_long:,} symptoms longer than 500 characters")
+    
+    # 7. Data quality checks
+    print(f"\n🔍 Data Quality Checks:")
+    
+    # Check for common data quality issues
+    empty_symptoms = (df['symptoms'].str.strip() == '').sum()
+    numeric_symptoms = df['symptoms'].str.isnumeric().sum()
+    single_char_symptoms = (df['symptoms'].str.len() == 1).sum()
+    
+    print(f"   Empty symptoms: {empty_symptoms}")
+    print(f"   Numeric-only symptoms: {numeric_symptoms}")
+    print(f"   Single character symptoms: {single_char_symptoms}")
+    
+    # 8. Cross-validation readiness check
+    print(f"\n✅ Cross-Validation Readiness:")
+    if len(disease_counts) < 2:
+        print("   ❌ Need at least 2 disease classes for classification")
+        return None
+    
+    min_samples_per_class = disease_counts.min()
+    if min_samples_per_class < 5:
+        print(f"   ⚠️  Some classes have very few samples ({min_samples_per_class})")
+    
+    # 9. Final statistics
+    final_size = len(df)
+    removed = original_size - final_size
+    
+    print(f"\n📊 Preprocessing Summary:")
+    print(f"   Original records: {original_size:,}")
+    print(f"   Final records: {final_size:,}")
+    print(f"   Removed: {removed:,} ({removed/original_size*100:.1f}%)")
+    print(f"   Data quality: {'✅ Good' if removed/original_size < 0.5 else '⚠️  High removal rate'}")
+    
+    return df
+
 def load_and_prepare(csv_path: str, json_path: str = None):
     # Load CSV data with robust error handling
     try:
@@ -266,6 +410,12 @@ def load_and_prepare(csv_path: str, json_path: str = None):
         df = df_csv
         print(f"✅ Using only CSV data: {len(df):,} records")
 
+    # Apply comprehensive EDA and preprocessing
+    df = perform_eda_and_preprocessing(df, "Combined Dataset")
+    
+    if df is None or len(df) == 0:
+        raise SystemExit("❌ Preprocessing failed or resulted in empty dataset")
+
     # Prepare text columns (but don't process yet - this will be done after train/test split)
     text_cols = ["symptoms"]
     if "description" in df.columns:
@@ -280,9 +430,10 @@ def load_and_prepare(csv_path: str, json_path: str = None):
     if numeric_cols:
         df[numeric_cols] = df[numeric_cols].fillna(0.0)
 
-    print(f"📊 Raw dataset shape: {df.shape}")
-    print(f"📋 Numeric columns: {numeric_cols}")
-    print(f"🎯 Disease distribution: {df['disease'].value_counts().head()}")
+    print(f"\n📊 Final preprocessed dataset:")
+    print(f"   Shape: {df.shape}")
+    print(f"   Numeric columns: {numeric_cols}")
+    print(f"   Ready for training: ✅")
     
     return df, numeric_cols
 
