@@ -266,60 +266,69 @@ def load_and_prepare(csv_path: str, json_path: str = None):
         df = df_csv
         print(f"✅ Using only CSV data: {len(df):,} records")
 
-    # text processing column: use 'symptoms' (and 'description' if present)
+    # Prepare text columns (but don't process yet - this will be done after train/test split)
     text_cols = ["symptoms"]
     if "description" in df.columns:
         text_cols.append("description")
     df["text_comb"] = df[text_cols].fillna("").agg(" ".join, axis=1)
-    df["text_proc"] = df["text_comb"].apply(lambda x: simple_tokenize(x, detect_lang(x))).astype(str)
-
-    # --- Data Augmentation: Synonym Replacement ---
-    # Simple synonym dictionary for demo purposes
-    synonym_dict = {
-        "fever": ["pyrexia", "high temperature"],
-        "cough": ["hack", "throat clearing"],
-        "headache": ["cephalalgia", "head pain"],
-        "pain": ["ache", "discomfort"],
-        "nausea": ["queasiness", "sickness"],
-        "vomiting": ["emesis", "throwing up"],
-        "rash": ["eruption", "skin spots"],
-        "chills": ["shivering", "cold sensation"]
-    }
-
-    def augment_text(text):
-        words = text.split()
-        aug_texts = []
-        for i, w in enumerate(words):
-            if w in synonym_dict:
-                for syn in synonym_dict[w]:
-                    aug = words.copy()
-                    aug[i] = syn
-                    aug_texts.append(" ".join(aug))
-        return aug_texts
-
-    # Augment the dataframe
-    aug_rows = []
-    for idx, row in df.iterrows():
-        aug_texts = augment_text(row["text_proc"])
-        for aug in aug_texts:
-            new_row = row.copy()
-            new_row["text_proc"] = aug
-            aug_rows.append(new_row)
-    if aug_rows:
-        df = pd.concat([df, pd.DataFrame(aug_rows)], ignore_index=True)
-
-    # numeric features: everything except text_cols and target
-    exclude = set(text_cols + ["text_comb", "text_proc", "disease"])
+    
+    # Identify numeric features
+    exclude = set(text_cols + ["text_comb", "disease"])
     numeric_cols = [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
-    # fill missing numeric with 0
+    
+    # Fill missing numeric values with 0
     if numeric_cols:
         df[numeric_cols] = df[numeric_cols].fillna(0.0)
 
-    # label encode target
-    le = LabelEncoder()
-    df["label_idx"] = le.fit_transform(df["disease"].astype(str))
+    print(f"📊 Raw dataset shape: {df.shape}")
+    print(f"📋 Numeric columns: {numeric_cols}")
+    print(f"🎯 Disease distribution: {df['disease'].value_counts().head()}")
+    
+    return df, numeric_cols
 
-    return df, numeric_cols, le
+def process_text_data(df, augment=True):
+    """Process text data with augmentation (only for training data)"""
+    # Process text
+    df["text_proc"] = df["text_comb"].apply(lambda x: simple_tokenize(x, detect_lang(x))).astype(str)
+    
+    if augment:
+        # Data augmentation only for training data
+        synonym_dict = {
+            "fever": ["pyrexia", "high temperature"],
+            "cough": ["hack", "throat clearing"],
+            "headache": ["cephalalgia", "head pain"],
+            "pain": ["ache", "discomfort"],
+            "nausea": ["queasiness", "sickness"],
+            "vomiting": ["emesis", "throwing up"],
+            "rash": ["eruption", "skin spots"],
+            "chills": ["shivering", "cold sensation"]
+        }
+
+        def augment_text(text):
+            words = text.split()
+            aug_texts = []
+            for i, w in enumerate(words):
+                if w in synonym_dict:
+                    for syn in synonym_dict[w]:
+                        aug = words.copy()
+                        aug[i] = syn
+                        aug_texts.append(" ".join(aug))
+            return aug_texts
+
+        # Augment the dataframe
+        aug_rows = []
+        for idx, row in df.iterrows():
+            aug_texts = augment_text(row["text_proc"])
+            for aug in aug_texts:
+                new_row = row.copy()
+                new_row["text_proc"] = aug
+                aug_rows.append(new_row)
+        
+        if aug_rows:
+            df = pd.concat([df, pd.DataFrame(aug_rows)], ignore_index=True)
+            print(f"✅ Added {len(aug_rows)} augmented samples")
+    
+    return df
 
 def precompute_encoder_embeddings(tokenizer, encoder, texts: List[str], max_len: int = MAX_LEN, batch_size: int = 16) -> np.ndarray:
     all_embs = []
@@ -560,7 +569,7 @@ def main():
         raise SystemExit(f"CSV not found: {args.csv}")
 
     print("Loading combined dataset (CSV + JSON)...")
-    df, numeric_cols, le = load_and_prepare(args.csv, args.json)
+    df, numeric_cols = load_and_prepare(args.csv, args.json)
     assert "symptoms" in df.columns and "disease" in df.columns, "Combined dataset must contain 'symptoms' and 'disease' columns"
 
     # load tokenizer + encoder
@@ -582,46 +591,15 @@ def main():
         # Split data
         df_train = df.iloc[train_idx].copy()
         df_test = df.iloc[test_idx].copy()
+        
+        print(f"📊 Train: {len(df_train):,} records, Test: {len(df_test):,} records")
 
-        # Augmentation only on training set
-        text_cols = ["symptoms"]
-        if "description" in df_train.columns:
-            text_cols.append("description")
-        df_train["text_comb"] = df_train[text_cols].fillna("").agg(" ".join, axis=1)
-        df_train["text_proc"] = df_train["text_comb"].apply(lambda x: simple_tokenize(x, detect_lang(x))).astype(str)
-        synonym_dict = {
-            "fever": ["pyrexia", "high temperature"],
-            "cough": ["hack", "throat clearing"],
-            "headache": ["cephalalgia", "head pain"],
-            "pain": ["ache", "discomfort"],
-            "nausea": ["queasiness", "sickness"],
-            "vomiting": ["emesis", "throwing up"],
-            "rash": ["eruption", "skin spots"],
-            "chills": ["shivering", "cold sensation"]
-        }
-        def augment_text(text):
-            words = text.split()
-            aug_texts = []
-            for i, w in enumerate(words):
-                if w in synonym_dict:
-                    for syn in synonym_dict[w]:
-                        aug = words.copy()
-                        aug[i] = syn
-                        aug_texts.append(" ".join(aug))
-            return aug_texts
-        aug_rows = []
-        for idx, row in df_train.iterrows():
-            aug_texts = augment_text(row["text_proc"])
-            for aug in aug_texts:
-                new_row = row.copy()
-                new_row["text_proc"] = aug
-                aug_rows.append(new_row)
-        if aug_rows:
-            df_train = pd.concat([df_train, pd.DataFrame(aug_rows)], ignore_index=True)
-
-        # Preprocess test set
-        df_test["text_comb"] = df_test[text_cols].fillna("").agg(" ".join, axis=1)
-        df_test["text_proc"] = df_test["text_comb"].apply(lambda x: simple_tokenize(x, detect_lang(x))).astype(str)
+        # Process text data AFTER splitting to prevent data leakage
+        print("🔄 Processing training data...")
+        df_train = process_text_data(df_train, augment=True)
+        
+        print("🔄 Processing test data...")
+        df_test = process_text_data(df_test, augment=False)  # No augmentation for test data
 
         # Numeric features
         exclude = set(text_cols + ["text_comb", "text_proc", "disease"])
@@ -635,14 +613,31 @@ def main():
             X_num_train = np.zeros((len(df_train), 0), dtype=np.float32)
             X_num_test = np.zeros((len(df_test), 0), dtype=np.float32)
 
-        # Labels
+        # Labels - fit encoder only on training data to prevent leakage
         le = LabelEncoder()
         y_train = le.fit_transform(df_train["disease"].astype(str))
         y_test = le.transform(df_test["disease"].astype(str))
+        
+        print(f"🎯 Training classes: {len(le.classes_)}")
+        print(f"📊 Class distribution in train: {pd.Series(y_train).value_counts().head()}")
 
 
-        # --- Diagnostics: Check for duplicates and class imbalance (memory optimized) ---
-        print(f"[Diagnostics] Processing {len(df_train):,} train and {len(df_test):,} test records...")
+        # --- Data Leakage Check ---
+        print(f"[Data Leakage Check] Processing {len(df_train):,} train and {len(df_test):,} test records...")
+        
+        # Check for exact text overlap between train and test
+        try:
+            train_texts = set(df_train["text_proc"])
+            test_texts = set(df_test["text_proc"])
+            exact_overlap = train_texts.intersection(test_texts)
+            print(f"🚨 EXACT TEXT OVERLAP: {len(exact_overlap)} samples")
+            if len(exact_overlap) > 0:
+                print("⚠️  WARNING: Data leakage detected! Some test samples appear in training data.")
+                print(f"   Overlapping samples: {list(exact_overlap)[:5]}...")
+            else:
+                print("✅ No exact text overlap detected")
+        except Exception as e:
+            print(f"[Data Leakage Check] Text overlap check failed: {e}")
         
         # Memory-efficient duplicate checking
         try:
@@ -739,6 +734,7 @@ def main():
     encoder.save_pretrained(enc_dir)
     trained_classifier.save_weights(args.out_weights)
 
+    # Use the label encoder from the last fold (they should all be the same)
     bundle = {
         "classifier_weights": os.path.abspath(args.out_weights),
         "label_encoder": le,
