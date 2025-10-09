@@ -507,24 +507,70 @@ def load_and_prepare(csv_path: str, json_path: str = None):
     if json_path and os.path.exists(json_path):
         df_json = load_json_data(json_path)
     
-    # Combine datasets
+    # Combine datasets with intelligent column handling
     if not df_json.empty:
         print(f"🔄 Combining datasets...")
         print(f"📊 CSV data: {len(df_csv):,} records")
         print(f"📊 JSON data: {len(df_json):,} records")
         
-        # Ensure both datasets have the same columns
-        common_cols = set(df_csv.columns) & set(df_json.columns)
-        print(f"🔗 Common columns: {list(common_cols)}")
+        print(f"📋 CSV columns: {list(df_csv.columns)}")
+        print(f"📋 JSON columns: {list(df_json.columns)}")
         
-        df_csv = df_csv[list(common_cols)]
-        df_json = df_json[list(common_cols)]
+        # Find common and unique columns
+        csv_cols = set(df_csv.columns)
+        json_cols = set(df_json.columns)
+        common_cols = csv_cols & json_cols
+        csv_only_cols = csv_cols - json_cols
+        json_only_cols = json_cols - csv_cols
+        
+        print(f"🔗 Common columns: {list(common_cols)}")
+        print(f"📊 CSV-only columns: {list(csv_only_cols)}")
+        print(f"📊 JSON-only columns: {list(json_only_cols)}")
+        
+        # Ensure both datasets have symptoms and disease (required)
+        required_cols = {'symptoms', 'disease'}
+        if not required_cols.issubset(common_cols):
+            print("❌ Error: Both datasets must have 'symptoms' and 'disease' columns")
+            raise ValueError("Missing required columns: symptoms and disease")
+        
+        # Create unified column set - include all columns from both datasets
+        all_cols = list(common_cols) + list(csv_only_cols) + list(json_only_cols)
+        print(f"🎯 All columns to include: {all_cols}")
+        
+        # Prepare datasets with all columns
+        df_csv_unified = df_csv.copy()
+        df_json_unified = df_json.copy()
+        
+        # Add missing columns to each dataset with appropriate defaults
+        for col in all_cols:
+            if col not in df_csv_unified.columns:
+                # Add missing column to CSV data with default values
+                if col in df_json_unified.columns:
+                    if df_json_unified[col].dtype in ['int64', 'float64']:
+                        df_csv_unified[col] = 0  # Default numeric value
+                    else:
+                        df_csv_unified[col] = 'unknown'  # Default categorical value
+                    print(f"   Added '{col}' to CSV data with default values")
+            
+            if col not in df_json_unified.columns:
+                # Add missing column to JSON data with default values
+                if col in df_csv_unified.columns:
+                    if df_csv_unified[col].dtype in ['int64', 'float64']:
+                        df_json_unified[col] = 0  # Default numeric value
+                    else:
+                        df_json_unified[col] = 'unknown'  # Default categorical value
+                    print(f"   Added '{col}' to JSON data with default values")
+        
+        # Ensure both datasets have the same column order
+        df_csv_unified = df_csv_unified[all_cols]
+        df_json_unified = df_json_unified[all_cols]
         
         # Combine the datasets
         print("⏳ Concatenating large datasets...")
-        df = pd.concat([df_csv, df_json], ignore_index=True)
-        print(f"✅ Combined dataset: {len(df_csv):,} CSV + {len(df_json):,} JSON = {len(df):,} total records")
+        df = pd.concat([df_csv_unified, df_json_unified], ignore_index=True)
+        print(f"✅ Combined dataset: {len(df_csv_unified):,} CSV + {len(df_json_unified):,} JSON = {len(df):,} total records")
         print(f"🎯 Total training data: {len(df):,} records")
+        print(f"📊 Final columns: {list(df.columns)}")
     else:
         df = df_csv
         print(f"✅ Using only CSV data: {len(df):,} records")
