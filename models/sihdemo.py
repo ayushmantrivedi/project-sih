@@ -205,7 +205,7 @@ def load_json_data(json_path: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 def perform_eda_and_preprocessing(df, dataset_name="Dataset"):
-    """Comprehensive EDA and preprocessing pipeline"""
+    """Comprehensive EDA and preprocessing pipeline with feature analysis"""
     print(f"\n🔍 EDA and Preprocessing for {dataset_name}")
     print("=" * 60)
     
@@ -220,7 +220,7 @@ def perform_eda_and_preprocessing(df, dataset_name="Dataset"):
         print(f"   {col}: {df[col].dtype} (missing: {df[col].isnull().sum():,})")
     
     # 2. Check for required columns
-    if "symptoms" not in df.columns or "disease" in df.columns:
+    if "symptoms" not in df.columns or "disease" not in df.columns:
         print("⚠️  Missing required columns. Attempting to find alternatives...")
         found_symptoms = None
         found_disease = None
@@ -336,7 +336,124 @@ def perform_eda_and_preprocessing(df, dataset_name="Dataset"):
     if min_samples_per_class < 5:
         print(f"   ⚠️  Some classes have very few samples ({min_samples_per_class})")
     
-    # 9. Final statistics
+    # 9. Comprehensive Feature Analysis
+    print(f"\n🔬 Comprehensive Feature Analysis:")
+    
+    # Analyze all available features
+    feature_analysis = {}
+    
+    for col in df.columns:
+        if col in ['symptoms', 'disease']:
+            continue
+            
+        col_data = df[col]
+        feature_analysis[col] = {
+            'type': str(col_data.dtype),
+            'missing': col_data.isnull().sum(),
+            'unique': col_data.nunique(),
+            'cardinality': col_data.nunique() / len(df) * 100
+        }
+        
+        if col_data.dtype in ['int64', 'float64']:
+            feature_analysis[col].update({
+                'mean': col_data.mean(),
+                'std': col_data.std(),
+                'min': col_data.min(),
+                'max': col_data.max(),
+                'median': col_data.median()
+            })
+        else:
+            feature_analysis[col].update({
+                'most_common': col_data.value_counts().head(3).to_dict(),
+                'is_categorical': col_data.nunique() < 50
+            })
+    
+    print(f"   📊 Feature Analysis Results:")
+    for feature, stats in feature_analysis.items():
+        print(f"   \n   🎯 {feature}:")
+        print(f"      Type: {stats['type']}")
+        print(f"      Missing: {stats['missing']:,} ({stats['missing']/len(df)*100:.1f}%)")
+        print(f"      Unique values: {stats['unique']:,}")
+        print(f"      Cardinality: {stats['cardinality']:.1f}%")
+        
+        if 'mean' in stats:
+            print(f"      Mean: {stats['mean']:.2f}")
+            print(f"      Std: {stats['std']:.2f}")
+            print(f"      Range: {stats['min']:.2f} - {stats['max']:.2f}")
+        else:
+            print(f"      Most common: {list(stats['most_common'].keys())[:3]}")
+            print(f"      Categorical: {'Yes' if stats['is_categorical'] else 'No'}")
+    
+    # 10. Feature Engineering Recommendations
+    print(f"\n💡 Feature Engineering Recommendations:")
+    
+    # Identify potential features for the model
+    numeric_features = []
+    categorical_features = []
+    text_features = []
+    
+    for col in df.columns:
+        if col in ['symptoms', 'disease']:
+            continue
+            
+        if df[col].dtype in ['int64', 'float64']:
+            numeric_features.append(col)
+        elif df[col].nunique() < 50:
+            categorical_features.append(col)
+        else:
+            text_features.append(col)
+    
+    print(f"   🔢 Numeric features ({len(numeric_features)}): {numeric_features}")
+    print(f"   📊 Categorical features ({len(categorical_features)}): {categorical_features}")
+    print(f"   📝 Text features ({len(text_features)}): {text_features}")
+    
+    # Feature importance analysis
+    print(f"\n🎯 Feature Importance Analysis:")
+    
+    # Analyze correlation with target (disease)
+    if len(numeric_features) > 0:
+        print(f"   📈 Numeric feature correlations with disease:")
+        disease_encoded = pd.Categorical(df['disease']).codes
+        for feature in numeric_features:
+            if df[feature].dtype in ['int64', 'float64']:
+                corr = df[feature].corr(pd.Series(disease_encoded))
+                print(f"      {feature}: {corr:.3f}")
+    
+    # Analyze categorical feature distributions
+    if len(categorical_features) > 0:
+        print(f"   📊 Categorical feature distributions:")
+        for feature in categorical_features:
+            print(f"      {feature}:")
+            value_counts = df[feature].value_counts().head(5)
+            for value, count in value_counts.items():
+                print(f"        {value}: {count:,} ({count/len(df)*100:.1f}%)")
+    
+    # 11. Model Input Recommendations
+    print(f"\n🤖 Model Input Recommendations:")
+    print(f"   🎯 Primary input: symptoms (text)")
+    print(f"   🔢 Secondary inputs: {numeric_features}")
+    print(f"   📊 Categorical inputs: {categorical_features}")
+    print(f"   🎯 Target: disease")
+    
+    # 12. Data Quality for ML
+    print(f"\n✅ ML Readiness Assessment:")
+    
+    # Check if we have enough features for a robust model
+    total_features = len(numeric_features) + len(categorical_features)
+    if total_features >= 3:
+        print(f"   ✅ Good feature diversity ({total_features} features)")
+    elif total_features >= 1:
+        print(f"   ⚠️  Limited features ({total_features} features) - consider adding more")
+    else:
+        print(f"   ❌ Very few features - model may struggle")
+    
+    # Check for feature-target balance
+    if len(disease_counts) >= 5:
+        print(f"   ✅ Good number of disease classes ({len(disease_counts)})")
+    else:
+        print(f"   ⚠️  Few disease classes ({len(disease_counts)}) - consider more diversity")
+    
+    # 13. Final statistics
     final_size = len(df)
     removed = original_size - final_size
     
@@ -345,6 +462,8 @@ def perform_eda_and_preprocessing(df, dataset_name="Dataset"):
     print(f"   Final records: {final_size:,}")
     print(f"   Removed: {removed:,} ({removed/original_size*100:.1f}%)")
     print(f"   Data quality: {'✅ Good' if removed/original_size < 0.5 else '⚠️  High removal rate'}")
+    print(f"   Features available: {len(df.columns) - 2} (excluding symptoms, disease)")
+    print(f"   Ready for multi-feature ML: {'✅ Yes' if total_features > 0 else '⚠️  Limited features'}")
     
     return df
 
@@ -496,41 +615,64 @@ def precompute_encoder_embeddings(tokenizer, encoder, texts: List[str], max_len:
 # -----------------------------
 # Classifier builder
 # -----------------------------
-def build_classifier(input_dim: int, num_classes: int, dropout: float = 0.3) -> tf.keras.Model:
+def build_classifier(input_dim: int, num_classes: int, dropout: float = 0.3, 
+                    text_dim: int = 768, numeric_dim: int = 0) -> tf.keras.Model:
+    """
+    Enhanced classifier with better feature fusion for multi-modal inputs
+    - Primary: Text features (symptoms) - 768 dimensions
+    - Secondary: Numeric features (age, severity, etc.)
+    - Categorical: Gender, etc. (encoded as numeric)
+    """
     inp = tf.keras.Input(shape=(input_dim,), dtype=tf.float32, name="fusion_input")
-
-    # Attention mechanism for feature fusion
-    # Assume first 768 are text features, rest are numeric
-    text_dim = 768
-    num_dim = input_dim - text_dim
+    
+    # Separate text and numeric features
     text_feats = tf.keras.layers.Lambda(lambda x: x[:, :text_dim])(inp)
-    num_feats = tf.keras.layers.Lambda(lambda x: x[:, text_dim:])(inp)
-    # Expand dims for attention
-    text_exp = tf.keras.layers.Reshape((text_dim, 1))(text_feats)
-    num_exp = tf.keras.layers.Reshape((num_dim, 1))(num_feats) if num_dim > 0 else None
-    # Concatenate for attention
-    if num_exp is not None:
-        fusion = tf.keras.layers.Concatenate(axis=1)([text_exp, num_exp])
+    numeric_feats = tf.keras.layers.Lambda(lambda x: x[:, text_dim:])(inp) if numeric_dim > 0 else None
+    
+    # Text processing branch (primary)
+    text_branch = tf.keras.layers.Dense(512, activation="relu", name="text_dense1")(text_feats)
+    text_branch = tf.keras.layers.BatchNormalization()(text_branch)
+    text_branch = tf.keras.layers.Dropout(dropout)(text_branch)
+    
+    text_branch = tf.keras.layers.Dense(256, activation="relu", name="text_dense2")(text_branch)
+    text_branch = tf.keras.layers.BatchNormalization()(text_branch)
+    text_branch = tf.keras.layers.Dropout(dropout)(text_branch)
+    
+    # Numeric processing branch (secondary)
+    if numeric_dim > 0:
+        numeric_branch = tf.keras.layers.Dense(max(64, numeric_dim * 2), activation="relu", name="numeric_dense1")(numeric_feats)
+        numeric_branch = tf.keras.layers.BatchNormalization()(numeric_branch)
+        numeric_branch = tf.keras.layers.Dropout(dropout)(numeric_branch)
+        
+        numeric_branch = tf.keras.layers.Dense(max(32, numeric_dim), activation="relu", name="numeric_dense2")(numeric_branch)
+        numeric_branch = tf.keras.layers.BatchNormalization()(numeric_branch)
+        numeric_branch = tf.keras.layers.Dropout(dropout)(numeric_branch)
+        
+        # Feature fusion with attention mechanism
+        # Concatenate text and numeric features
+        fused = tf.keras.layers.Concatenate(axis=1, name="feature_fusion")([text_branch, numeric_branch])
+        
+        # Attention mechanism to weight different feature types
+        attention_weights = tf.keras.layers.Dense(1, activation="sigmoid", name="attention")(fused)
+        attended_features = tf.keras.layers.Multiply(name="attended_features")([fused, attention_weights])
+        
     else:
-        fusion = text_exp
-    # Simple attention: learn weights for each feature
-    attn = tf.keras.layers.Dense(1, activation="softmax")(fusion)
-    attn_out = tf.keras.layers.Multiply()([fusion, attn])
-    attn_flat = tf.keras.layers.Flatten()(attn_out)
-
-    x = tf.keras.layers.Dense(input_dim, activation="relu")(attn_flat)
+        # Only text features
+        attended_features = text_branch
+    
+    # Final classification layers
+    x = tf.keras.layers.Dense(128, activation="relu", name="final_dense1")(attended_features)
     x = tf.keras.layers.BatchNormalization()(x)
     x = tf.keras.layers.Dropout(dropout)(x)
-    x = tf.keras.layers.Dense(max(256, input_dim//2), activation="relu")(x)
+    
+    x = tf.keras.layers.Dense(64, activation="relu", name="final_dense2")(x)
     x = tf.keras.layers.BatchNormalization()(x)
     x = tf.keras.layers.Dropout(dropout)(x)
-    x = tf.keras.layers.Dense(128, activation="relu")(x)
-    x = tf.keras.layers.BatchNormalization()(x)
-    x = tf.keras.layers.Dropout(dropout)(x)
-    x = tf.keras.layers.Dense(64, activation="relu")(x)
-    x = tf.keras.layers.Dropout(dropout)(x)
-    logits = tf.keras.layers.Dense(num_classes, name="logits")(x)  # logits, from_logits=True
-    model = tf.keras.Model(inputs=inp, outputs=logits, name="fusion_classifier")
+    
+    # Output layer
+    logits = tf.keras.layers.Dense(num_classes, name="logits")(x)
+    
+    model = tf.keras.Model(inputs=inp, outputs=logits, name="enhanced_fusion_classifier")
     return model
 
 # -----------------------------
@@ -851,7 +993,19 @@ def main():
         test_fused = fuse(emb_test, X_num_test)
         num_classes = len(le.classes_)
         input_dim = train_fused.shape[1]
-        classifier = build_classifier(input_dim, num_classes, dropout=0.3)
+        
+        # Calculate dimensions for enhanced classifier
+        text_dim = 768  # BERT embedding dimension
+        numeric_dim = X_num_train.shape[1] if X_num_train.shape[1] > 0 else 0
+        
+        print(f"🏗️  Building enhanced classifier:")
+        print(f"   Total input dimension: {input_dim}")
+        print(f"   Text features: {text_dim}")
+        print(f"   Numeric features: {numeric_dim}")
+        print(f"   Number of classes: {num_classes}")
+        
+        classifier = build_classifier(input_dim, num_classes, dropout=0.3, 
+                                   text_dim=text_dim, numeric_dim=numeric_dim)
         _ = classifier(np.zeros((1, input_dim), dtype=np.float32))
         trained_classifier = train_with_global_local_line_search(
             classifier,
