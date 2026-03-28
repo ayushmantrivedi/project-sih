@@ -8,6 +8,8 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # suppress TF INFO
 
 import re
 import random
+import json
+import gc
 from typing import List, Optional, Tuple
 import argparse
 
@@ -25,9 +27,10 @@ from transformers import BertTokenizerFast, TFBertModel
 # -----------------------------
 MODEL_NAME = "emilyalsentzer/Bio_ClinicalBERT"
 CSV_PATH = r"C:\Users\ayush\OneDrive\Desktop\augmented_synthetic_health_dataset.csv"  # hardcoded raw string
+JSON_PATH = r"C:\Users\ayush\OneDrive\Desktop\diagnosis_data.json"  # JSON data path
 MAX_LEN = 64
-BATCH_SIZE = 16
-NUM_EPOCHS = 30
+BATCH_SIZE = 32  # Increased for large dataset
+NUM_EPOCHS = 20  # Reduced for faster training with large dataset
 BASE_LR = 2e-5
 SEED = 42
 EN_STOPWORDS = set(["and","or","the","is","a","an","it","to","of","in","for","on","with"])
@@ -83,66 +86,567 @@ def simple_tokenize(text: str, lang_hint: Optional[str] = None) -> str:
 # -----------------------------
 # Data prep and embedding precompute
 # -----------------------------
-def load_and_prepare(csv_path: str):
-    df = pd.read_csv(csv_path)
-    assert "symptoms" in df.columns and "disease" in df.columns, "CSV must contain 'symptoms' and 'disease' columns"
+def load_json_data(json_path: str) -> pd.DataFrame:
+    """Load data from JSON file and convert to DataFrame with robust error handling"""
+    try:
+        print(f"🔄 Loading large JSON file: {json_path}")
+        print("⏳ This may take a moment for 100,000 records...")
+        
+        with open(json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # Convert JSON to DataFrame
+        df = pd.DataFrame(data)
+        print(f"📊 Raw JSON data shape: {df.shape}")
+        print(f"📋 Available columns: {list(df.columns)}")
+        
+        # Robust column mapping - try different possible column names
+        column_mapping = {
+            'symptoms': ['symptoms', 'symptom', 'symptom_text', 'complaint', 'complaints', 'description', 'desc'],
+            'disease': ['disease', 'diagnosis', 'condition', 'illness', 'disorder', 'label', 'target', 'outcome']
+        }
+        
+        # Find the best matching columns
+        found_symptoms = None
+        found_disease = None
+        
+        for col in df.columns:
+            col_lower = col.lower().strip()
+            for symptom_variant in column_mapping['symptoms']:
+                if symptom_variant in col_lower or col_lower in symptom_variant:
+                    found_symptoms = col
+                    break
+            if found_symptoms:
+                break
+        
+        for col in df.columns:
+            col_lower = col.lower().strip()
+            for disease_variant in column_mapping['disease']:
+                if disease_variant in col_lower or col_lower in disease_variant:
+                    found_disease = col
+                    break
+            if found_disease:
+                break
+        
+        # Handle missing required columns
+        if not found_symptoms and not found_disease:
+            print("⚠️  No suitable columns found for symptoms or disease")
+            print("💡 Available columns:", list(df.columns))
+            print("🔄 Attempting to use first two text columns...")
+            
+            # Try to use first two text columns
+            text_cols = []
+            for col in df.columns:
+                if df[col].dtype == 'object':  # Text columns
+                    text_cols.append(col)
+            
+            if len(text_cols) >= 2:
+                found_symptoms = text_cols[0]
+                found_disease = text_cols[1]
+                print(f"✅ Using '{found_symptoms}' as symptoms and '{found_disease}' as disease")
+            else:
+                print("❌ Not enough text columns found. Skipping JSON data.")
+                return pd.DataFrame()
+        
+        elif not found_symptoms:
+            print("⚠️  No symptoms column found. Looking for alternative...")
+            # Use description or first text column as symptoms
+            text_cols = [col for col in df.columns if df[col].dtype == 'object' and col != found_disease]
+            if text_cols:
+                found_symptoms = text_cols[0]
+                print(f"✅ Using '{found_symptoms}' as symptoms")
+            else:
+                print("❌ No suitable symptoms column found. Skipping JSON data.")
+                return pd.DataFrame()
+        
+        elif not found_disease:
+            print("⚠️  No disease column found. Looking for alternative...")
+            # Use last text column or create dummy disease
+            text_cols = [col for col in df.columns if df[col].dtype == 'object' and col != found_symptoms]
+            if text_cols:
+                found_disease = text_cols[-1]
+                print(f"✅ Using '{found_disease}' as disease")
+            else:
+                print("⚠️  No disease column found. Creating 'unknown' disease for all records...")
+                df['disease'] = 'unknown'
+                found_disease = 'disease'
+        
+        # Rename columns to standard format
+        df_standardized = df.copy()
+        if found_symptoms != 'symptoms':
+            df_standardized['symptoms'] = df[found_symptoms]
+            print(f"🔄 Renamed '{found_symptoms}' → 'symptoms'")
+        
+        if found_disease != 'disease':
+            df_standardized['disease'] = df[found_disease]
+            print(f"🔄 Renamed '{found_disease}' → 'disease'")
+        
+        # Clean and validate the data
+        df_standardized = df_standardized.dropna(subset=['symptoms', 'disease'])
+        df_standardized['symptoms'] = df_standardized['symptoms'].astype(str)
+        df_standardized['disease'] = df_standardized['disease'].astype(str)
+        
+        # Remove empty or very short entries
+        df_standardized = df_standardized[
+            (df_standardized['symptoms'].str.len() > 3) & 
+            (df_standardized['disease'].str.len() > 1)
+        ]
+        
+        print(f"✅ Successfully loaded and processed {len(df_standardized):,} records from JSON file")
+        print(f"📊 Final JSON data shape: {df_standardized.shape}")
+        print(f"📋 Final columns: {list(df_standardized.columns)}")
+        print(f"🎯 Disease distribution: {df_standardized['disease'].value_counts().head()}")
+        
+        return df_standardized
+        
+    except Exception as e:
+        print(f"❌ Error loading JSON file {json_path}: {e}")
+        print("💡 The model will continue with CSV data only")
+        return pd.DataFrame()
 
-    # text processing column: use 'symptoms' (and 'description' if present)
+def perform_eda_and_preprocessing(df, dataset_name="Dataset"):
+    """Comprehensive EDA and preprocessing pipeline with feature analysis"""
+    print(f"\n🔍 EDA and Preprocessing for {dataset_name}")
+    print("=" * 60)
+    
+    original_size = len(df)
+    print(f"📊 Original dataset size: {original_size:,} records")
+    print(f"📋 Columns: {list(df.columns)}")
+    print(f"📊 Shape: {df.shape}")
+    
+    # 1. Basic Info
+    print(f"\n📈 Data Types:")
+    for col in df.columns:
+        print(f"   {col}: {df[col].dtype} (missing: {df[col].isnull().sum():,})")
+    
+    # 2. Check for required columns
+    if "symptoms" not in df.columns or "disease" not in df.columns:
+        print("⚠️  Missing required columns. Attempting to find alternatives...")
+        found_symptoms = None
+        found_disease = None
+        
+        for col in df.columns:
+            col_lower = col.lower().strip()
+            if any(x in col_lower for x in ['symptom', 'complaint', 'description', 'text']):
+                found_symptoms = col
+            if any(x in col_lower for x in ['disease', 'diagnosis', 'condition', 'label', 'target']):
+                found_disease = col
+        
+        if found_symptoms and found_disease:
+            df['symptoms'] = df[found_symptoms]
+            df['disease'] = df[found_disease]
+            print(f"✅ Mapped '{found_symptoms}' → 'symptoms' and '{found_disease}' → 'disease'")
+        else:
+            raise ValueError("Cannot find suitable columns for symptoms and disease")
+    
+    # 3. Clean symptoms data
+    print(f"\n🧹 Cleaning symptoms data...")
+    symptoms_before = len(df)
+    
+    # Remove rows with missing symptoms or disease
+    df = df.dropna(subset=['symptoms', 'disease'])
+    print(f"   Removed {symptoms_before - len(df):,} rows with missing symptoms/disease")
+    
+    # Convert to string and clean
+    df['symptoms'] = df['symptoms'].astype(str).str.strip()
+    df['disease'] = df['disease'].astype(str).str.strip()
+    
+    # Remove empty or very short symptoms
+    df = df[df['symptoms'].str.len() > 3]
+    df = df[df['symptoms'] != '']
+    df = df[df['symptoms'] != 'nan']
+    
+    # Remove very short diseases
+    df = df[df['disease'].str.len() > 1]
+    df = df[df['disease'] != '']
+    df = df[df['disease'] != 'nan']
+    
+    symptoms_after = len(df)
+    print(f"   Removed {symptoms_before - symptoms_after:,} rows with invalid symptoms/disease")
+    
+    # 4. Deduplication analysis
+    print(f"\n🔍 Duplicate Analysis:")
+    total_duplicates = df.duplicated().sum()
+    symptom_duplicates = df.duplicated(subset=['symptoms']).sum()
+    full_duplicates = df.duplicated(subset=['symptoms', 'disease']).sum()
+    
+    print(f"   Total duplicates: {total_duplicates:,}")
+    print(f"   Symptom duplicates: {symptom_duplicates:,}")
+    print(f"   Full duplicates: {full_duplicates:,}")
+    
+    # Remove duplicates
+    df_before_dedup = len(df)
+    df = df.drop_duplicates(subset=['symptoms', 'disease'], keep='first')
+    df_after_dedup = len(df)
+    print(f"   Removed {df_before_dedup - df_after_dedup:,} duplicate records")
+    
+    # 5. Disease distribution analysis
+    print(f"\n🎯 Disease Distribution Analysis:")
+    disease_counts = df['disease'].value_counts()
+    print(f"   Total unique diseases: {len(disease_counts)}")
+    print(f"   Most common diseases:")
+    for disease, count in disease_counts.head(10).items():
+        print(f"     {disease}: {count:,} ({count/len(df)*100:.1f}%)")
+    
+    # Check for class imbalance
+    min_class_size = disease_counts.min()
+    max_class_size = disease_counts.max()
+    imbalance_ratio = max_class_size / min_class_size
+    
+    print(f"   Class imbalance ratio: {imbalance_ratio:.1f}:1")
+    if imbalance_ratio > 10:
+        print("   ⚠️  High class imbalance detected")
+    elif imbalance_ratio > 5:
+        print("   ⚠️  Moderate class imbalance detected")
+    else:
+        print("   ✅ Balanced classes")
+    
+    # 6. Symptoms analysis
+    print(f"\n📝 Symptoms Analysis:")
+    symptom_lengths = df['symptoms'].str.len()
+    print(f"   Average symptom length: {symptom_lengths.mean():.1f} characters")
+    print(f"   Min length: {symptom_lengths.min()}")
+    print(f"   Max length: {symptom_lengths.max()}")
+    print(f"   Median length: {symptom_lengths.median():.1f}")
+    
+    # Check for very long symptoms (potential data quality issues)
+    very_long = (symptom_lengths > 500).sum()
+    if very_long > 0:
+        print(f"   ⚠️  {very_long:,} symptoms longer than 500 characters")
+    
+    # 7. Data quality checks
+    print(f"\n🔍 Data Quality Checks:")
+    
+    # Check for common data quality issues
+    empty_symptoms = (df['symptoms'].str.strip() == '').sum()
+    numeric_symptoms = df['symptoms'].str.isnumeric().sum()
+    single_char_symptoms = (df['symptoms'].str.len() == 1).sum()
+    
+    print(f"   Empty symptoms: {empty_symptoms}")
+    print(f"   Numeric-only symptoms: {numeric_symptoms}")
+    print(f"   Single character symptoms: {single_char_symptoms}")
+    
+    # 8. Cross-validation readiness check
+    print(f"\n✅ Cross-Validation Readiness:")
+    if len(disease_counts) < 2:
+        print("   ❌ Need at least 2 disease classes for classification")
+        return None
+    
+    min_samples_per_class = disease_counts.min()
+    if min_samples_per_class < 5:
+        print(f"   ⚠️  Some classes have very few samples ({min_samples_per_class})")
+    
+    # 9. Comprehensive Feature Analysis
+    print(f"\n🔬 Comprehensive Feature Analysis:")
+    
+    # Analyze all available features
+    feature_analysis = {}
+    
+    for col in df.columns:
+        if col in ['symptoms', 'disease']:
+            continue
+            
+        col_data = df[col]
+        feature_analysis[col] = {
+            'type': str(col_data.dtype),
+            'missing': col_data.isnull().sum(),
+            'unique': col_data.nunique(),
+            'cardinality': col_data.nunique() / len(df) * 100
+        }
+        
+        if col_data.dtype in ['int64', 'float64']:
+            feature_analysis[col].update({
+                'mean': col_data.mean(),
+                'std': col_data.std(),
+                'min': col_data.min(),
+                'max': col_data.max(),
+                'median': col_data.median()
+            })
+        else:
+            feature_analysis[col].update({
+                'most_common': col_data.value_counts().head(3).to_dict(),
+                'is_categorical': col_data.nunique() < 50
+            })
+    
+    print(f"   📊 Feature Analysis Results:")
+    for feature, stats in feature_analysis.items():
+        print(f"   \n   🎯 {feature}:")
+        print(f"      Type: {stats['type']}")
+        print(f"      Missing: {stats['missing']:,} ({stats['missing']/len(df)*100:.1f}%)")
+        print(f"      Unique values: {stats['unique']:,}")
+        print(f"      Cardinality: {stats['cardinality']:.1f}%")
+        
+        if 'mean' in stats:
+            print(f"      Mean: {stats['mean']:.2f}")
+            print(f"      Std: {stats['std']:.2f}")
+            print(f"      Range: {stats['min']:.2f} - {stats['max']:.2f}")
+        else:
+            print(f"      Most common: {list(stats['most_common'].keys())[:3]}")
+            print(f"      Categorical: {'Yes' if stats['is_categorical'] else 'No'}")
+    
+    # 10. Feature Engineering Recommendations
+    print(f"\n💡 Feature Engineering Recommendations:")
+    
+    # Identify potential features for the model
+    numeric_features = []
+    categorical_features = []
+    text_features = []
+    
+    for col in df.columns:
+        if col in ['symptoms', 'disease']:
+            continue
+            
+        if df[col].dtype in ['int64', 'float64']:
+            numeric_features.append(col)
+        elif df[col].nunique() < 50:
+            categorical_features.append(col)
+        else:
+            text_features.append(col)
+    
+    print(f"   🔢 Numeric features ({len(numeric_features)}): {numeric_features}")
+    print(f"   📊 Categorical features ({len(categorical_features)}): {categorical_features}")
+    print(f"   📝 Text features ({len(text_features)}): {text_features}")
+    
+    # Feature importance analysis
+    print(f"\n🎯 Feature Importance Analysis:")
+    
+    # Analyze correlation with target (disease)
+    if len(numeric_features) > 0:
+        print(f"   📈 Numeric feature correlations with disease:")
+        disease_encoded = pd.Categorical(df['disease']).codes
+        for feature in numeric_features:
+            if df[feature].dtype in ['int64', 'float64']:
+                corr = df[feature].corr(pd.Series(disease_encoded))
+                print(f"      {feature}: {corr:.3f}")
+    
+    # Analyze categorical feature distributions
+    if len(categorical_features) > 0:
+        print(f"   📊 Categorical feature distributions:")
+        for feature in categorical_features:
+            print(f"      {feature}:")
+            value_counts = df[feature].value_counts().head(5)
+            for value, count in value_counts.items():
+                print(f"        {value}: {count:,} ({count/len(df)*100:.1f}%)")
+    
+    # 11. Model Input Recommendations
+    print(f"\n🤖 Model Input Recommendations:")
+    print(f"   🎯 Primary input: symptoms (text)")
+    print(f"   🔢 Secondary inputs: {numeric_features}")
+    print(f"   📊 Categorical inputs: {categorical_features}")
+    print(f"   🎯 Target: disease")
+    
+    # 12. Data Quality for ML
+    print(f"\n✅ ML Readiness Assessment:")
+    
+    # Check if we have enough features for a robust model
+    total_features = len(numeric_features) + len(categorical_features)
+    if total_features >= 3:
+        print(f"   ✅ Good feature diversity ({total_features} features)")
+    elif total_features >= 1:
+        print(f"   ⚠️  Limited features ({total_features} features) - consider adding more")
+    else:
+        print(f"   ❌ Very few features - model may struggle")
+    
+    # Check for feature-target balance
+    if len(disease_counts) >= 5:
+        print(f"   ✅ Good number of disease classes ({len(disease_counts)})")
+    else:
+        print(f"   ⚠️  Few disease classes ({len(disease_counts)}) - consider more diversity")
+    
+    # 13. Final statistics
+    final_size = len(df)
+    removed = original_size - final_size
+    
+    print(f"\n📊 Preprocessing Summary:")
+    print(f"   Original records: {original_size:,}")
+    print(f"   Final records: {final_size:,}")
+    print(f"   Removed: {removed:,} ({removed/original_size*100:.1f}%)")
+    print(f"   Data quality: {'✅ Good' if removed/original_size < 0.5 else '⚠️  High removal rate'}")
+    print(f"   Features available: {len(df.columns) - 2} (excluding symptoms, disease)")
+    print(f"   Ready for multi-feature ML: {'✅ Yes' if total_features > 0 else '⚠️  Limited features'}")
+    
+    return df
+
+def load_and_prepare(csv_path: str, json_path: str = None):
+    # Load CSV data with robust error handling
+    try:
+        df_csv = pd.read_csv(csv_path)
+        print(f"✅ Loaded {len(df_csv):,} records from CSV file: {csv_path}")
+        print(f"📋 CSV columns: {list(df_csv.columns)}")
+        
+        # Check for required columns in CSV
+        if "symptoms" not in df_csv.columns or "disease" not in df_csv.columns:
+            print("⚠️  CSV missing required columns. Attempting to find alternatives...")
+            
+            # Try to find alternative column names
+            found_symptoms = None
+            found_disease = None
+            
+            for col in df_csv.columns:
+                col_lower = col.lower().strip()
+                if any(x in col_lower for x in ['symptom', 'complaint', 'description']):
+                    found_symptoms = col
+                if any(x in col_lower for x in ['disease', 'diagnosis', 'condition', 'label']):
+                    found_disease = col
+            
+            if found_symptoms and found_disease:
+                df_csv['symptoms'] = df_csv[found_symptoms]
+                df_csv['disease'] = df_csv[found_disease]
+                print(f"✅ Mapped '{found_symptoms}' → 'symptoms' and '{found_disease}' → 'disease'")
+            else:
+                raise ValueError("CSV file must contain 'symptoms' and 'disease' columns or suitable alternatives")
+        
+        print(f"✅ CSV data validated: {len(df_csv):,} records")
+        
+    except Exception as e:
+        print(f"❌ Error loading CSV file {csv_path}: {e}")
+        raise SystemExit(f"Failed to load CSV data: {e}")
+    
+    # Load JSON data if provided
+    df_json = pd.DataFrame()
+    if json_path and os.path.exists(json_path):
+        df_json = load_json_data(json_path)
+    
+    # Combine datasets with intelligent column handling
+    if not df_json.empty:
+        print(f"🔄 Combining datasets...")
+        print(f"📊 CSV data: {len(df_csv):,} records")
+        print(f"📊 JSON data: {len(df_json):,} records")
+        
+        print(f"📋 CSV columns: {list(df_csv.columns)}")
+        print(f"📋 JSON columns: {list(df_json.columns)}")
+        
+        # Find common and unique columns
+        csv_cols = set(df_csv.columns)
+        json_cols = set(df_json.columns)
+        common_cols = csv_cols & json_cols
+        csv_only_cols = csv_cols - json_cols
+        json_only_cols = json_cols - csv_cols
+        
+        print(f"🔗 Common columns: {list(common_cols)}")
+        print(f"📊 CSV-only columns: {list(csv_only_cols)}")
+        print(f"📊 JSON-only columns: {list(json_only_cols)}")
+        
+        # Ensure both datasets have symptoms and disease (required)
+        required_cols = {'symptoms', 'disease'}
+        if not required_cols.issubset(common_cols):
+            print("❌ Error: Both datasets must have 'symptoms' and 'disease' columns")
+            raise ValueError("Missing required columns: symptoms and disease")
+        
+        # Create unified column set - include all columns from both datasets
+        all_cols = list(common_cols) + list(csv_only_cols) + list(json_only_cols)
+        print(f"🎯 All columns to include: {all_cols}")
+        
+        # Prepare datasets with all columns
+        df_csv_unified = df_csv.copy()
+        df_json_unified = df_json.copy()
+        
+        # Add missing columns to each dataset with appropriate defaults
+        for col in all_cols:
+            if col not in df_csv_unified.columns:
+                # Add missing column to CSV data with default values
+                if col in df_json_unified.columns:
+                    if df_json_unified[col].dtype in ['int64', 'float64']:
+                        df_csv_unified[col] = 0  # Default numeric value
+                    else:
+                        df_csv_unified[col] = 'unknown'  # Default categorical value
+                    print(f"   Added '{col}' to CSV data with default values")
+            
+            if col not in df_json_unified.columns:
+                # Add missing column to JSON data with default values
+                if col in df_csv_unified.columns:
+                    if df_csv_unified[col].dtype in ['int64', 'float64']:
+                        df_json_unified[col] = 0  # Default numeric value
+                    else:
+                        df_json_unified[col] = 'unknown'  # Default categorical value
+                    print(f"   Added '{col}' to JSON data with default values")
+        
+        # Ensure both datasets have the same column order
+        df_csv_unified = df_csv_unified[all_cols]
+        df_json_unified = df_json_unified[all_cols]
+        
+        # Combine the datasets
+        print("⏳ Concatenating large datasets...")
+        df = pd.concat([df_csv_unified, df_json_unified], ignore_index=True)
+        print(f"✅ Combined dataset: {len(df_csv_unified):,} CSV + {len(df_json_unified):,} JSON = {len(df):,} total records")
+        print(f"🎯 Total training data: {len(df):,} records")
+        print(f"📊 Final columns: {list(df.columns)}")
+    else:
+        df = df_csv
+        print(f"✅ Using only CSV data: {len(df):,} records")
+
+    # Apply comprehensive EDA and preprocessing
+    df = perform_eda_and_preprocessing(df, "Combined Dataset")
+    
+    if df is None or len(df) == 0:
+        raise SystemExit("❌ Preprocessing failed or resulted in empty dataset")
+
+    # Prepare text columns (but don't process yet - this will be done after train/test split)
     text_cols = ["symptoms"]
     if "description" in df.columns:
         text_cols.append("description")
     df["text_comb"] = df[text_cols].fillna("").agg(" ".join, axis=1)
-    df["text_proc"] = df["text_comb"].apply(lambda x: simple_tokenize(x, detect_lang(x))).astype(str)
-
-    # --- Data Augmentation: Synonym Replacement ---
-    # Simple synonym dictionary for demo purposes
-    synonym_dict = {
-        "fever": ["pyrexia", "high temperature"],
-        "cough": ["hack", "throat clearing"],
-        "headache": ["cephalalgia", "head pain"],
-        "pain": ["ache", "discomfort"],
-        "nausea": ["queasiness", "sickness"],
-        "vomiting": ["emesis", "throwing up"],
-        "rash": ["eruption", "skin spots"],
-        "chills": ["shivering", "cold sensation"]
-    }
-
-    def augment_text(text):
-        words = text.split()
-        aug_texts = []
-        for i, w in enumerate(words):
-            if w in synonym_dict:
-                for syn in synonym_dict[w]:
-                    aug = words.copy()
-                    aug[i] = syn
-                    aug_texts.append(" ".join(aug))
-        return aug_texts
-
-    # Augment the dataframe
-    aug_rows = []
-    for idx, row in df.iterrows():
-        aug_texts = augment_text(row["text_proc"])
-        for aug in aug_texts:
-            new_row = row.copy()
-            new_row["text_proc"] = aug
-            aug_rows.append(new_row)
-    if aug_rows:
-        df = pd.concat([df, pd.DataFrame(aug_rows)], ignore_index=True)
-
-    # numeric features: everything except text_cols and target
-    exclude = set(text_cols + ["text_comb", "text_proc", "disease"])
+    
+    # Identify numeric features
+    exclude = set(text_cols + ["text_comb", "disease"])
     numeric_cols = [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
-    # fill missing numeric with 0
+    
+    # Fill missing numeric values with 0
     if numeric_cols:
         df[numeric_cols] = df[numeric_cols].fillna(0.0)
 
-    # label encode target
-    le = LabelEncoder()
-    df["label_idx"] = le.fit_transform(df["disease"].astype(str))
+    print(f"\n📊 Final preprocessed dataset:")
+    print(f"   Shape: {df.shape}")
+    print(f"   Numeric columns: {numeric_cols}")
+    print(f"   Ready for training: ✅")
+    
+    return df, numeric_cols
 
-    return df, numeric_cols, le
+def process_text_data(df, augment=True):
+    """Process text data with augmentation (only for training data)"""
+    # Process text
+    df["text_proc"] = df["text_comb"].apply(lambda x: simple_tokenize(x, detect_lang(x))).astype(str)
+    
+    if augment:
+        # Data augmentation only for training data
+        synonym_dict = {
+            "fever": ["pyrexia", "high temperature"],
+            "cough": ["hack", "throat clearing"],
+            "headache": ["cephalalgia", "head pain"],
+            "pain": ["ache", "discomfort"],
+            "nausea": ["queasiness", "sickness"],
+            "vomiting": ["emesis", "throwing up"],
+            "rash": ["eruption", "skin spots"],
+            "chills": ["shivering", "cold sensation"]
+        }
 
-def precompute_encoder_embeddings(tokenizer, encoder, texts: List[str], max_len: int = MAX_LEN, batch_size: int = 32) -> np.ndarray:
+        def augment_text(text):
+            words = text.split()
+            aug_texts = []
+            for i, w in enumerate(words):
+                if w in synonym_dict:
+                    for syn in synonym_dict[w]:
+                        aug = words.copy()
+                        aug[i] = syn
+                        aug_texts.append(" ".join(aug))
+            return aug_texts
+
+        # Augment the dataframe
+        aug_rows = []
+        for idx, row in df.iterrows():
+            aug_texts = augment_text(row["text_proc"])
+            for aug in aug_texts:
+                new_row = row.copy()
+                new_row["text_proc"] = aug
+                aug_rows.append(new_row)
+        
+        if aug_rows:
+            df = pd.concat([df, pd.DataFrame(aug_rows)], ignore_index=True)
+            print(f"✅ Added {len(aug_rows)} augmented samples")
+    
+    return df
+
+def precompute_encoder_embeddings(tokenizer, encoder, texts: List[str], max_len: int = MAX_LEN, batch_size: int = 16) -> np.ndarray:
     all_embs = []
     for i in range(0, len(texts), batch_size):
         batch_texts = texts[i:i+batch_size]
@@ -157,41 +661,64 @@ def precompute_encoder_embeddings(tokenizer, encoder, texts: List[str], max_len:
 # -----------------------------
 # Classifier builder
 # -----------------------------
-def build_classifier(input_dim: int, num_classes: int, dropout: float = 0.3) -> tf.keras.Model:
+def build_classifier(input_dim: int, num_classes: int, dropout: float = 0.3, 
+                    text_dim: int = 768, numeric_dim: int = 0) -> tf.keras.Model:
+    """
+    Enhanced classifier with better feature fusion for multi-modal inputs
+    - Primary: Text features (symptoms) - 768 dimensions
+    - Secondary: Numeric features (age, severity, etc.)
+    - Categorical: Gender, etc. (encoded as numeric)
+    """
     inp = tf.keras.Input(shape=(input_dim,), dtype=tf.float32, name="fusion_input")
-
-    # Attention mechanism for feature fusion
-    # Assume first 768 are text features, rest are numeric
-    text_dim = 768
-    num_dim = input_dim - text_dim
+    
+    # Separate text and numeric features
     text_feats = tf.keras.layers.Lambda(lambda x: x[:, :text_dim])(inp)
-    num_feats = tf.keras.layers.Lambda(lambda x: x[:, text_dim:])(inp)
-    # Expand dims for attention
-    text_exp = tf.keras.layers.Reshape((text_dim, 1))(text_feats)
-    num_exp = tf.keras.layers.Reshape((num_dim, 1))(num_feats) if num_dim > 0 else None
-    # Concatenate for attention
-    if num_exp is not None:
-        fusion = tf.keras.layers.Concatenate(axis=1)([text_exp, num_exp])
+    numeric_feats = tf.keras.layers.Lambda(lambda x: x[:, text_dim:])(inp) if numeric_dim > 0 else None
+    
+    # Text processing branch (primary)
+    text_branch = tf.keras.layers.Dense(512, activation="relu", name="text_dense1")(text_feats)
+    text_branch = tf.keras.layers.BatchNormalization()(text_branch)
+    text_branch = tf.keras.layers.Dropout(dropout)(text_branch)
+    
+    text_branch = tf.keras.layers.Dense(256, activation="relu", name="text_dense2")(text_branch)
+    text_branch = tf.keras.layers.BatchNormalization()(text_branch)
+    text_branch = tf.keras.layers.Dropout(dropout)(text_branch)
+    
+    # Numeric processing branch (secondary)
+    if numeric_dim > 0:
+        numeric_branch = tf.keras.layers.Dense(max(64, numeric_dim * 2), activation="relu", name="numeric_dense1")(numeric_feats)
+        numeric_branch = tf.keras.layers.BatchNormalization()(numeric_branch)
+        numeric_branch = tf.keras.layers.Dropout(dropout)(numeric_branch)
+        
+        numeric_branch = tf.keras.layers.Dense(max(32, numeric_dim), activation="relu", name="numeric_dense2")(numeric_branch)
+        numeric_branch = tf.keras.layers.BatchNormalization()(numeric_branch)
+        numeric_branch = tf.keras.layers.Dropout(dropout)(numeric_branch)
+        
+        # Feature fusion with attention mechanism
+        # Concatenate text and numeric features
+        fused = tf.keras.layers.Concatenate(axis=1, name="feature_fusion")([text_branch, numeric_branch])
+        
+        # Attention mechanism to weight different feature types
+        attention_weights = tf.keras.layers.Dense(1, activation="sigmoid", name="attention")(fused)
+        attended_features = tf.keras.layers.Multiply(name="attended_features")([fused, attention_weights])
+        
     else:
-        fusion = text_exp
-    # Simple attention: learn weights for each feature
-    attn = tf.keras.layers.Dense(1, activation="softmax")(fusion)
-    attn_out = tf.keras.layers.Multiply()([fusion, attn])
-    attn_flat = tf.keras.layers.Flatten()(attn_out)
-
-    x = tf.keras.layers.Dense(input_dim, activation="relu")(attn_flat)
+        # Only text features
+        attended_features = text_branch
+    
+    # Final classification layers
+    x = tf.keras.layers.Dense(128, activation="relu", name="final_dense1")(attended_features)
     x = tf.keras.layers.BatchNormalization()(x)
     x = tf.keras.layers.Dropout(dropout)(x)
-    x = tf.keras.layers.Dense(max(256, input_dim//2), activation="relu")(x)
+    
+    x = tf.keras.layers.Dense(64, activation="relu", name="final_dense2")(x)
     x = tf.keras.layers.BatchNormalization()(x)
     x = tf.keras.layers.Dropout(dropout)(x)
-    x = tf.keras.layers.Dense(128, activation="relu")(x)
-    x = tf.keras.layers.BatchNormalization()(x)
-    x = tf.keras.layers.Dropout(dropout)(x)
-    x = tf.keras.layers.Dense(64, activation="relu")(x)
-    x = tf.keras.layers.Dropout(dropout)(x)
-    logits = tf.keras.layers.Dense(num_classes, name="logits")(x)  # logits, from_logits=True
-    model = tf.keras.Model(inputs=inp, outputs=logits, name="fusion_classifier")
+    
+    # Output layer
+    logits = tf.keras.layers.Dense(num_classes, name="logits")(x)
+    
+    model = tf.keras.Model(inputs=inp, outputs=logits, name="enhanced_fusion_classifier")
     return model
 
 # -----------------------------
@@ -369,6 +896,7 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--csv", type=str, default=CSV_PATH)
+    parser.add_argument("--json", type=str, default=JSON_PATH)
     parser.add_argument("--out_weights", type=str, default="best_classifier_weights.h5")
     parser.add_argument("--out_bundle", type=str, default="sih_model_bundle.joblib")
     parser.add_argument("--epochs", type=int, default=NUM_EPOCHS)
@@ -379,10 +907,9 @@ def main():
     if not os.path.exists(args.csv):
         raise SystemExit(f"CSV not found: {args.csv}")
 
-
-    print("Loading dataframe...")
-    df = pd.read_csv(args.csv)
-    assert "symptoms" in df.columns and "disease" in df.columns, "CSV must contain 'symptoms' and 'disease' columns"
+    print("Loading combined dataset (CSV + JSON)...")
+    df, numeric_cols = load_and_prepare(args.csv, args.json)
+    assert "symptoms" in df.columns and "disease" in df.columns, "Combined dataset must contain 'symptoms' and 'disease' columns"
 
     # load tokenizer + encoder
     print("Loading tokenizer and TF encoder (this will download model if not present)...")
@@ -403,48 +930,20 @@ def main():
         # Split data
         df_train = df.iloc[train_idx].copy()
         df_test = df.iloc[test_idx].copy()
+        
+        print(f"📊 Train: {len(df_train):,} records, Test: {len(df_test):,} records")
 
-        # Augmentation only on training set
+        # Process text data AFTER splitting to prevent data leakage
+        print("🔄 Processing training data...")
+        df_train = process_text_data(df_train, augment=True)
+        
+        print("🔄 Processing test data...")
+        df_test = process_text_data(df_test, augment=False)  # No augmentation for test data
+
+        # Numeric features
         text_cols = ["symptoms"]
         if "description" in df_train.columns:
             text_cols.append("description")
-        df_train["text_comb"] = df_train[text_cols].fillna("").agg(" ".join, axis=1)
-        df_train["text_proc"] = df_train["text_comb"].apply(lambda x: simple_tokenize(x, detect_lang(x))).astype(str)
-        synonym_dict = {
-            "fever": ["pyrexia", "high temperature"],
-            "cough": ["hack", "throat clearing"],
-            "headache": ["cephalalgia", "head pain"],
-            "pain": ["ache", "discomfort"],
-            "nausea": ["queasiness", "sickness"],
-            "vomiting": ["emesis", "throwing up"],
-            "rash": ["eruption", "skin spots"],
-            "chills": ["shivering", "cold sensation"]
-        }
-        def augment_text(text):
-            words = text.split()
-            aug_texts = []
-            for i, w in enumerate(words):
-                if w in synonym_dict:
-                    for syn in synonym_dict[w]:
-                        aug = words.copy()
-                        aug[i] = syn
-                        aug_texts.append(" ".join(aug))
-            return aug_texts
-        aug_rows = []
-        for idx, row in df_train.iterrows():
-            aug_texts = augment_text(row["text_proc"])
-            for aug in aug_texts:
-                new_row = row.copy()
-                new_row["text_proc"] = aug
-                aug_rows.append(new_row)
-        if aug_rows:
-            df_train = pd.concat([df_train, pd.DataFrame(aug_rows)], ignore_index=True)
-
-        # Preprocess test set
-        df_test["text_comb"] = df_test[text_cols].fillna("").agg(" ".join, axis=1)
-        df_test["text_proc"] = df_test["text_comb"].apply(lambda x: simple_tokenize(x, detect_lang(x))).astype(str)
-
-        # Numeric features
         exclude = set(text_cols + ["text_comb", "text_proc", "disease"])
         numeric_cols = [c for c in df_train.columns if c not in exclude and pd.api.types.is_numeric_dtype(df_train[c])]
         # Scaling: fit only on train, transform both
@@ -456,29 +955,80 @@ def main():
             X_num_train = np.zeros((len(df_train), 0), dtype=np.float32)
             X_num_test = np.zeros((len(df_test), 0), dtype=np.float32)
 
-        # Labels
+        # Labels - fit encoder only on training data to prevent leakage
         le = LabelEncoder()
         y_train = le.fit_transform(df_train["disease"].astype(str))
         y_test = le.transform(df_test["disease"].astype(str))
+        
+        print(f"🎯 Training classes: {len(le.classes_)}")
+        print(f"📊 Class distribution in train: {pd.Series(y_train).value_counts().head()}")
 
 
-        # --- Diagnostics: Check for duplicates and class imbalance ---
-        train_dupes = df_train.duplicated(subset=["text_proc"] + numeric_cols).sum()
-        test_dupes = df_test.duplicated(subset=["text_proc"] + numeric_cols).sum()
-        overlap = pd.merge(df_train, df_test, on=["text_proc"] + numeric_cols, how="inner")
-        print(f"[Diagnostics] Train duplicates: {train_dupes}, Test duplicates: {test_dupes}, Overlap: {len(overlap)}")
-        train_class_counts = df_train["disease"].value_counts()
-        test_class_counts = df_test["disease"].value_counts()
-        print(f"[Diagnostics] Train class distribution:\n{train_class_counts}")
-        print(f"[Diagnostics] Test class distribution:\n{test_class_counts}")
+        # --- Data Leakage Check ---
+        print(f"[Data Leakage Check] Processing {len(df_train):,} train and {len(df_test):,} test records...")
+        
+        # Check for exact text overlap between train and test
+        try:
+            train_texts = set(df_train["text_proc"])
+            test_texts = set(df_test["text_proc"])
+            exact_overlap = train_texts.intersection(test_texts)
+            print(f"🚨 EXACT TEXT OVERLAP: {len(exact_overlap)} samples")
+            if len(exact_overlap) > 0:
+                print("⚠️  WARNING: Data leakage detected! Some test samples appear in training data.")
+                print(f"   Overlapping samples: {list(exact_overlap)[:5]}...")
+            else:
+                print("✅ No exact text overlap detected")
+        except Exception as e:
+            print(f"[Data Leakage Check] Text overlap check failed: {e}")
+        
+        # Memory-efficient duplicate checking
+        try:
+            train_dupes = df_train.duplicated(subset=["text_proc"]).sum()
+            test_dupes = df_test.duplicated(subset=["text_proc"]).sum()
+            print(f"[Diagnostics] Train duplicates: {train_dupes}, Test duplicates: {test_dupes}")
+        except Exception as e:
+            print(f"[Diagnostics] Duplicate check skipped due to memory constraints: {e}")
+            train_dupes = test_dupes = 0
+        
+        # Memory-efficient overlap checking (sample-based for large datasets)
+        try:
+            if len(df_train) > 10000 or len(df_test) > 10000:
+                # Sample-based overlap check for large datasets
+                sample_size = min(5000, len(df_train), len(df_test))
+                train_sample = df_train.sample(n=sample_size, random_state=42)
+                test_sample = df_test.sample(n=sample_size, random_state=42)
+                overlap = pd.merge(train_sample, test_sample, on=["text_proc"], how="inner")
+                estimated_overlap = len(overlap) * (len(df_train) * len(df_test)) / (sample_size * sample_size)
+                print(f"[Diagnostics] Estimated overlap: ~{int(estimated_overlap):,} (based on {sample_size:,} sample)")
+            else:
+                overlap = pd.merge(df_train, df_test, on=["text_proc"], how="inner")
+                print(f"[Diagnostics] Overlap: {len(overlap)}")
+        except Exception as e:
+            print(f"[Diagnostics] Overlap check skipped due to memory constraints: {e}")
+        
+        # Class distribution (memory efficient)
+        try:
+            train_class_counts = df_train["disease"].value_counts()
+            test_class_counts = df_test["disease"].value_counts()
+            print(f"[Diagnostics] Train classes: {len(train_class_counts)}, Test classes: {len(test_class_counts)}")
+            print(f"[Diagnostics] Top 5 train classes: {train_class_counts.head().to_dict()}")
+            print(f"[Diagnostics] Top 5 test classes: {test_class_counts.head().to_dict()}")
+        except Exception as e:
+            print(f"[Diagnostics] Class distribution check failed: {e}")
 
         # Training and evaluation for this fold
         texts_train = df_train["text_proc"].tolist()
         texts_test = df_test["text_proc"].tolist()
-        print("Precomputing encoder embeddings for train set...")
-        emb_train = precompute_encoder_embeddings(tokenizer, encoder, texts_train, max_len=MAX_LEN, batch_size=32)
-        print("Precomputing encoder embeddings for test set...")
-        emb_test = precompute_encoder_embeddings(tokenizer, encoder, texts_test, max_len=MAX_LEN, batch_size=32)
+        
+        # Memory optimization for large datasets
+        batch_size_emb = 8 if len(texts_train) > 50000 else 16
+        
+        print(f"Precomputing encoder embeddings for train set ({len(texts_train):,} records)...")
+        print(f"Using batch size: {batch_size_emb} for memory optimization")
+        emb_train = precompute_encoder_embeddings(tokenizer, encoder, texts_train, max_len=MAX_LEN, batch_size=batch_size_emb)
+        
+        print(f"Precomputing encoder embeddings for test set ({len(texts_test):,} records)...")
+        emb_test = precompute_encoder_embeddings(tokenizer, encoder, texts_test, max_len=MAX_LEN, batch_size=batch_size_emb)
 
         def fuse(emb, num):
             if num is None or num.shape[-1] == 0:
@@ -489,7 +1039,19 @@ def main():
         test_fused = fuse(emb_test, X_num_test)
         num_classes = len(le.classes_)
         input_dim = train_fused.shape[1]
-        classifier = build_classifier(input_dim, num_classes, dropout=0.3)
+        
+        # Calculate dimensions for enhanced classifier
+        text_dim = 768  # BERT embedding dimension
+        numeric_dim = X_num_train.shape[1] if X_num_train.shape[1] > 0 else 0
+        
+        print(f"🏗️  Building enhanced classifier:")
+        print(f"   Total input dimension: {input_dim}")
+        print(f"   Text features: {text_dim}")
+        print(f"   Numeric features: {numeric_dim}")
+        print(f"   Number of classes: {num_classes}")
+        
+        classifier = build_classifier(input_dim, num_classes, dropout=0.3, 
+                                   text_dim=text_dim, numeric_dim=numeric_dim)
         _ = classifier(np.zeros((1, input_dim), dtype=np.float32))
         trained_classifier = train_with_global_local_line_search(
             classifier,
@@ -504,6 +1066,12 @@ def main():
         test_loss, test_acc, test_f1, test_preds, test_trues = eval_on_fused_numpy(trained_classifier, test_fused, y_test, loss_fn)
         print(f"Fold {fold+1} | Loss: {test_loss:.6f} | Acc: {test_acc:.4f} | F1: {test_f1:.4f}")
         fold_metrics.append((test_loss, test_acc, test_f1))
+        
+        # Memory cleanup after each fold
+        del df_train, df_test, texts_train, texts_test, emb_train, emb_test, train_fused, test_fused
+        del trained_classifier, classifier
+        gc.collect()
+        print(f"🧹 Memory cleaned after fold {fold+1}")
 
     # Report average metrics
     avg_loss = np.mean([m[0] for m in fold_metrics])
@@ -520,6 +1088,7 @@ def main():
     encoder.save_pretrained(enc_dir)
     trained_classifier.save_weights(args.out_weights)
 
+    # Use the label encoder from the last fold (they should all be the same)
     bundle = {
         "classifier_weights": os.path.abspath(args.out_weights),
         "label_encoder": le,

@@ -1,92 +1,66 @@
-from apis.clinicaltrials import get_clinical_trials
-from apis.cowin import get_cowin_stats
-from apis.mohfw import get_mohfw_data
-from apis.umls import get_umls_info
-from models.ml_predict import predict_disease
-from config import get_config
-from utils import get_logger, log_api_call
+from utils import get_logger, get_search_engine, get_vector_db_manager, get_llama_client
+from agents.debate_manager import get_debate_manager
+from mcp_server import mcp # We import the MCP instance to access tools
+import json
 
-def generate_bot_response(user_message):
+logger = get_logger("chatbot")
+
+def generate_bot_response(user_message, user_id="anonymous"):
     """
-    Generate bot response based on user message
+    Main Agent Orchestrator for MediAgent A2A/MCP Evolution.
     """
-    config = get_config()
-    logger = get_logger("chatbot")
+    logger.info(f"Orchestrating response for user: {user_id}")
     
     try:
-        user_message_lower = user_message.lower()
+        # Step 1: Researcher Agent - Live Web Scrape & Rank
+        # We call the MCP tool directly as an Orchestrator action
+        logger.info("Step 1: Researching web content...")
+        search_engine = get_search_engine()
+        results = search_engine.get_best_results(user_message)
         
-        # Check for specific API queries
-        if "trial" in user_message_lower or "clinical trial" in user_message_lower:
-            try:
-                trials = get_clinical_trials(user_message)
-                return {"type": "clinical_trials", "content": trials}
-            except Exception as e:
-                logger.error(f"Error fetching clinical trials: {str(e)}")
-                return {"type": "error", "content": "Unable to fetch clinical trial information at the moment."}
-                
-        elif "cowin" in user_message_lower or "vaccine" in user_message_lower or "vaccination" in user_message_lower:
-            try:
-                stats = get_cowin_stats()
-                return {"type": "cowin", "content": stats}
-            except Exception as e:
-                logger.error(f"Error fetching CoWIN data: {str(e)}")
-                return {"type": "error", "content": "Unable to fetch vaccination information at the moment."}
-                
-        elif "covid" in user_message_lower or "mohfw" in user_message_lower or "coronavirus" in user_message_lower:
-            try:
-                stats = get_mohfw_data()
-                return {"type": "covid", "content": stats}
-            except Exception as e:
-                logger.error(f"Error fetching MoHFW data: {str(e)}")
-                return {"type": "error", "content": "Unable to fetch COVID-19 information at the moment."}
-                
-        elif "define" in user_message_lower or "what is" in user_message_lower:
-            try:
-                term = user_message.replace("define", "").replace("what is", "").strip()
-                info = get_umls_info(term)
-                return {"type": "umls", "content": info}
-            except Exception as e:
-                logger.error(f"Error fetching UMLS info: {str(e)}")
-                return {"type": "error", "content": "Unable to fetch medical definition at the moment."}
-                
+        rag_evidence = ""
+        if results:
+            evidence_parts = []
+            for i, res in enumerate(results):
+                evidence_parts.append(f"Source [{i+1}]: {res['text']}\nURL: {res['meta']['url']}")
+            rag_evidence = "\n\n".join(evidence_parts)
         else:
-            # ML prediction for symptoms/disease
-            try:
-                label, conf, probs = predict_disease(user_message)
-                
-                # Determine confidence level and format response accordingly
-                if conf >= config.ml.HIGH_CONFIDENCE_THRESHOLD:
-                    confidence_level = "high"
-                elif conf >= config.ml.MEDIUM_CONFIDENCE_THRESHOLD:
-                    confidence_level = "medium"
-                else:
-                    confidence_level = "low"
-                
-                response = {
-                    "type": "diagnosis",
-                    "disease": label,
-                    "confidence": conf,
-                    "confidence_level": confidence_level,
-                    "probabilities": probs.tolist() if hasattr(probs, 'tolist') else probs
-                }
-                
-                # Add disclaimer for low confidence predictions
-                if confidence_level == "low":
-                    response["disclaimer"] = "This is a low-confidence prediction. Please consult a healthcare professional."
-                
-                return response
-                
-            except Exception as e:
-                logger.error(f"Error in ML prediction: {str(e)}")
-                return {
-                    "type": "error", 
-                    "content": "I'm having trouble analyzing your symptoms right now. Please try again or consult a healthcare professional."
-                }
-                
+            rag_evidence = "No specific web evidence found."
+            
+        # Step 2: Context Agent - Retrieve User History
+        logger.info("Step 2: Retrieving user history...")
+        db_manager = get_vector_db_manager()
+        user_history = db_manager.query_history(user_id, user_message)
+        history_text = "\n---\n".join(user_history) if user_history else "No previous history."
+        
+        # Step 3: Reasoning Engine - A2A Debate Loop
+        logger.info("Step 3: Running A2A Reasoning Debate...")
+        debate_engine = get_debate_manager()
+        debate_result = debate_engine.run_debate(user_message, rag_evidence, history_text)
+        
+        final_answer = debate_result["final_answer"]
+        
+        # Step 4: Persistent Memory - Store Interaction
+        logger.info("Step 4: Persisting interaction...")
+        db_manager.add_interaction(user_id, user_message, final_answer)
+        
+        # Step 5: Format for Delivery (WhatsApp/SMS Optimized)
+        response_data = {
+            "type": "agentic_reasoning",
+            "content": final_answer,
+            "status": "verified",
+            "metadata": {
+                "evidence_used": len(results) if results else 0,
+                "history_found": True if user_history else False
+            }
+        }
+        
+        return response_data
+        
     except Exception as e:
-        logger.error(f"Unexpected error in generate_bot_response: {str(e)}")
+        logger.error(f"Error in Orchestrator: {str(e)}")
         return {
             "type": "error",
-            "content": "I encountered an unexpected error. Please try again."
+            "content": "Our reasoning engine encountered an issue. Please try again soon.",
+            "error_detail": str(e)
         }
