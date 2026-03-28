@@ -37,9 +37,10 @@ CORS(app)
 
 # Initialize rate limiter
 limiter = Limiter(
-    app,
-    key_func=get_remote_address,
-    default_limits=[f"{config.app.RATE_LIMIT_PER_MINUTE} per minute"]
+    get_remote_address,
+    app=app,
+    default_limits=[f"{config.app.RATE_LIMIT_PER_MINUTE} per minute"],
+    storage_uri="memory://"
 )
 
 @app.route('/health', methods=['GET'])
@@ -70,23 +71,22 @@ def chat():
                 "error": "Empty message"
             }), 400
         
-        # Get user ID for logging (if provided)
+        # Get user ID for tracking (critical for per-user persistent memory)
         user_id = data.get('user_id', 'anonymous')
         
-        # Generate bot response
-        response = generate_bot_response(user_message)
+        # Generate bot response using the new Agent Orchestrator
+        response_data = generate_bot_response(user_message, user_id=user_id)
         
         # Log the interaction
         from utils import log_user_interaction
         log_user_interaction(
             user_id=user_id,
             message=user_message,
-            response=str(response),
-            confidence=response.get('confidence'),
-            prediction=response.get('disease')
+            response=response_data.get('content', ''),
+            prediction="MediAgent Analysis"
         )
         
-        return jsonify(response)
+        return jsonify(response_data)
         
     except Exception as e:
         logger.error(f"Error in chat endpoint: {str(e)}")
@@ -108,16 +108,14 @@ def whatsapp_webhook():
         if not incoming_msg:
             return "No message received", 400
         
-        # Generate response
-        response_data = generate_bot_response(incoming_msg)
+        # Use incoming number as user_id for persistent memory
+        user_id = from_number
         
-        # Format response for WhatsApp
-        if response_data.get('type') == 'diagnosis':
-            reply = f"Based on your symptoms, I suggest: {response_data.get('disease', 'Unknown')}"
-            if response_data.get('confidence'):
-                reply += f" (Confidence: {response_data['confidence']:.1%})"
-        else:
-            reply = str(response_data.get('content', 'Sorry, I could not process your request.'))
+        # Generate agentic response
+        response_data = generate_bot_response(incoming_msg, user_id=user_id)
+        
+        # Format response for WhatsApp (Directly use the 'content' or reasoning)
+        reply = response_data.get('content', 'Sorry, I could not process your request.')
         
         # Create Twilio response
         resp = MessagingResponse()
@@ -126,11 +124,10 @@ def whatsapp_webhook():
         # Log the interaction
         from utils import log_user_interaction
         log_user_interaction(
-            user_id=from_number,
+            user_id=user_id,
             message=incoming_msg,
             response=reply,
-            confidence=response_data.get('confidence'),
-            prediction=response_data.get('disease')
+            prediction="MediAgent Analysis"
         )
         
         return str(resp)
@@ -154,16 +151,12 @@ def sms_webhook():
         if not incoming_msg:
             return "No message received", 400
         
-        # Generate response
-        response_data = generate_bot_response(incoming_msg)
+        # Generate response using phone number as session identifier
+        user_id = from_number
+        response_data = generate_bot_response(incoming_msg, user_id=user_id)
         
-        # Format response for SMS (shorter)
-        if response_data.get('type') == 'diagnosis':
-            reply = f"Diagnosis: {response_data.get('disease', 'Unknown')}"
-            if response_data.get('confidence'):
-                reply += f" ({response_data['confidence']:.1%})"
-        else:
-            reply = str(response_data.get('content', 'Unable to process request.'))
+        # Format response for SMS (More concise summaries)
+        reply = response_data.get('content', 'Unable to process request.')
         
         # Truncate if too long for SMS
         if len(reply) > 160:
@@ -176,11 +169,10 @@ def sms_webhook():
         # Log the interaction
         from utils import log_user_interaction
         log_user_interaction(
-            user_id=from_number,
+            user_id=user_id,
             message=incoming_msg,
             response=reply,
-            confidence=response_data.get('confidence'),
-            prediction=response_data.get('disease')
+            prediction="MediAgent Analysis"
         )
         
         return str(resp)
